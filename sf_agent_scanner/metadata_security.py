@@ -68,17 +68,21 @@ class SecurityAuditor:
         self.permset_classes = defaultdict(set)
         self.profile_meta = {}
 
-    def add_finding(self, category, severity, target, file_path, issue, remediation=""):
+    def add_finding(self, category, severity, target, file_path, issue, remediation="", rule_id=None, line_num=1):
         rel_file = ""
         try:
             rel_file = str(Path(file_path).relative_to(self.repo_dir))
         except Exception:
             rel_file = str(file_path)
+        if not rule_id:
+            rule_id = category.replace(" ", "_").replace("/", "_")
         self.findings.append({
+            "rule_id": rule_id,
             "category": category,
             "severity": severity,
             "target": target,
             "file": rel_file,
+            "line": line_num or 1,
             "issue": issue,
             "remediation": remediation
         })
@@ -109,6 +113,26 @@ class SecurityAuditor:
                     "user_license": user_license,
                     "is_custom": is_custom
                 }
+
+                # Contiguity check (SFDX-FLS-001)
+                seen_tags = set()
+                last_tag = None
+                for child in root:
+                    tag = strip_ns(child.tag)
+                    if tag != last_tag:
+                        if tag in seen_tags:
+                            self.add_finding(
+                                category="Metadata Deployment Integrity",
+                                severity="HIGH",
+                                target=f"{profile_name} -> <{tag}>",
+                                file_path=p_file,
+                                issue=f"<{tag}> elements are split into non-contiguous groups in {p_file.name}. Salesforce Metadata API rejects split element groups.",
+                                remediation=f"Group all <{tag}> elements together contiguously in the XML source.",
+                                rule_id="SFDX-FLS-001"
+                            )
+                            break
+                        seen_tags.add(tag)
+                        last_tag = tag
 
                 for child in root:
                     tag = strip_ns(child.tag)
@@ -210,6 +234,26 @@ class SecurityAuditor:
                 root = get_xml_root(ps_file)
                 if root is None:
                     continue
+
+                # Contiguity check (SFDX-FLS-001)
+                seen_tags = set()
+                last_tag = None
+                for child in root:
+                    tag = strip_ns(child.tag)
+                    if tag != last_tag:
+                        if tag in seen_tags:
+                            self.add_finding(
+                                category="Metadata Deployment Integrity",
+                                severity="HIGH",
+                                target=f"{ps_name} -> <{tag}>",
+                                file_path=ps_file,
+                                issue=f"<{tag}> elements are split into non-contiguous groups in {ps_file.name}. Salesforce Metadata API rejects split element groups.",
+                                remediation=f"Group all <{tag}> elements together contiguously in the XML source.",
+                                rule_id="SFDX-FLS-001"
+                            )
+                            break
+                        seen_tags.add(tag)
+                        last_tag = tag
 
                 for child in root:
                     tag = strip_ns(child.tag)
@@ -605,6 +649,282 @@ class SecurityAuditor:
             except Exception:
                 continue
 
+    def audit_action_overrides(self):
+        """SFDX-OVERRIDE-001: Verifies CustomObject action overrides reference existing components."""
+        objects_dir = self.force_app / "objects"
+        if not objects_dir.exists():
+            return
+
+        lwc_names = {d.name for d in (self.force_app / "lwc").iterdir() if d.is_dir()} if (self.force_app / "lwc").exists() else set()
+        aura_names = {d.name for d in (self.force_app / "aura").iterdir() if d.is_dir()} if (self.force_app / "aura").exists() else set()
+        flexipages = {f.stem.replace(".flexipage-meta", "") for f in (self.force_app / "flexipages").glob("*.flexipage-meta.xml")} if (self.force_app / "flexipages").exists() else set()
+
+        for obj_file in objects_dir.glob("**/*.object-meta.xml"):
+            obj_name = obj_file.stem.replace(".object-meta", "")
+            root = get_xml_root(obj_file)
+            if root is None:
+                continue
+
+            for child in root:
+                if strip_ns(child.tag) == "actionOverrides":
+                    action_name = "Unknown"
+                    content = None
+                    action_type = None
+                    for sub in child:
+                        subtag = strip_ns(sub.tag)
+                        if subtag == "actionName":
+                            action_name = sub.text
+                        elif subtag == "content":
+                            content = sub.text
+                        elif subtag == "type":
+                            action_type = sub.text
+
+                    if content and action_type in ["LightningComponent", "FlexiPage"]:
+                        exists = False
+                        if action_type == "LightningComponent":
+                            exists = (content in lwc_names or content in aura_names)
+                        elif action_type == "FlexiPage":
+                            exists = (content in flexipages)
+
+                        if not exists:
+                            self.add_finding(
+                                category="Metadata Integrity",
+                                severity="CRITICAL",
+                                target=f"{obj_name} -> {action_name} Override",
+                                file_path=obj_file,
+                                issue=f"Action override for '{action_name}' references non-existent {action_type} '{content}'. Causes deployment failure in target orgs.",
+                                remediation=f"Ensure '{content}' exists in force-app/main/default/{'lwc/' if action_type == 'LightningComponent' else 'flexipages/'} or remove the override.",
+                                rule_id="SFDX-OVERRIDE-001"
+                            )
+
+    def audit_sfdx_project(self):
+        """SFDX-VERSION-001: Verifies sfdx-project.json sourceApiVersion discipline."""
+        proj_file = self.repo_dir / "sfdx-project.json"
+        if not proj_file.exists():
+            return
+        try:
+            with open(proj_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            api_ver_str = str(data.get("sourceApiVersion", ""))
+            if api_ver_str:
+                api_ver = float(api_ver_str)
+                if api_ver < 58.0:
+                    self.add_finding(
+                        category="Salesforce DX Discipline",
+                        severity="MEDIUM",
+                        target="sfdx-project.json",
+                        file_path=proj_file,
+                        issue=f"sourceApiVersion is '{api_ver_str}', which is significantly outdated. Deprecated versions cause false CI deployment errors (e.g. viewAllFields).",
+                        remediation="Update sourceApiVersion in sfdx-project.json to match target org release (recommended 62.0+).",
+                        rule_id="SFDX-VERSION-001"
+                    )
+        except Exception:
+            pass
+
+    def audit_agentforce_bundles(self):
+        """AGENT-BUNDLE-001: Checks AiAuthoringBundle backing logic exists in repo."""
+        bundles_dir = self.force_app / "aiAuthoringBundles"
+        if not bundles_dir.exists():
+            return
+
+        classes = {f.stem for f in (self.force_app / "classes").glob("*.cls")} if (self.force_app / "classes").exists() else set()
+        flows = {f.stem.replace(".flow-meta", "") for f in (self.force_app / "flows").glob("*.flow-meta.xml")} if (self.force_app / "flows").exists() else set()
+
+        for b_dir in bundles_dir.iterdir():
+            if not b_dir.is_dir():
+                continue
+            bundle_name = b_dir.name
+            for agent_file in b_dir.glob("*.agent"):
+                try:
+                    content = agent_file.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+
+                # 1. Backing logic checks (AGENT-BUNDLE-001)
+                for target_match in re.finditer(r'target\s*:\s*["\']apex://([^"\']+)["\']', content):
+                    cls_name = target_match.group(1).strip()
+                    if cls_name not in classes:
+                        self.add_finding(
+                            category="Agentforce Script Integrity",
+                            severity="HIGH",
+                            target=f"{bundle_name} -> apex://{cls_name}",
+                            file_path=agent_file,
+                            issue=f"Agent Script references backing Apex class '{cls_name}', which does not exist in the repository.",
+                            remediation=f"Create and deploy Invocable Apex class '{cls_name}' with @InvocableMethod.",
+                            rule_id="AGENT-BUNDLE-001"
+                        )
+                for target_match in re.finditer(r'target\s*:\s*["\']flow://([^"\']+)["\']', content):
+                    flow_name = target_match.group(1).strip()
+                    if flow_name not in flows:
+                        self.add_finding(
+                            category="Agentforce Script Integrity",
+                            severity="HIGH",
+                            target=f"{bundle_name} -> flow://{flow_name}",
+                            file_path=agent_file,
+                            issue=f"Agent Script references backing Flow '{flow_name}', which does not exist in the repository.",
+                            remediation=f"Create and deploy Autolaunched Flow '{flow_name}'.",
+                            rule_id="AGENT-BUNDLE-001"
+                        )
+
+                # 2. Block Ordering Check (AGENT-BUNDLE-002)
+                block_order = ["system", "config", "variables", "connection", "knowledge", "language", "start_agent", "subagent"]
+                block_positions = []
+                for b_name in block_order:
+                    m = re.search(r'^[ \t]*' + re.escape(b_name) + r'\s*[:\b]', content, re.MULTILINE)
+                    if m:
+                        block_positions.append((m.start(), b_name, block_order.index(b_name)))
+                block_positions.sort(key=lambda x: x[0])
+                prev_rank = -1
+                for _, b_name, rank in block_positions:
+                    if rank < prev_rank:
+                        self.add_finding(
+                            category="Agentforce Script Integrity",
+                            severity="HIGH",
+                            target=f"{bundle_name} -> Block Order",
+                            file_path=agent_file,
+                            issue=f"Top-level block '{b_name}' violates mandatory Agent Script block order (system, config, variables, connection, knowledge, language, start_agent, subagent).",
+                            remediation="Reorder blocks according to Agent Script core specification.",
+                            rule_id="AGENT-BUNDLE-002"
+                        )
+                        break
+                    prev_rank = rank
+
+                # 3. Lifecycle hook & scope misuse (AGENT-BUNDLE-003)
+                if re.search(r'(before_reasoning|after_reasoning)\s*:\s*\n[ \t]*instructions\s*:\s*->', content):
+                    self.add_finding(
+                        category="Agentforce Script Integrity",
+                        severity="CRITICAL",
+                        target=f"{bundle_name} -> Lifecycle Hooks",
+                        file_path=agent_file,
+                        issue="Lifecycle hook (before_reasoning/after_reasoning) incorrectly wrapped in 'instructions: ->'. Causes compile error.",
+                        remediation="Place statements directly under the lifecycle hook block without instructions wrapper.",
+                        rule_id="AGENT-BUNDLE-003"
+                    )
+
+                if re.search(r'set\s+@variables\.\w+\s*=\s*@inputs\.', content):
+                    self.add_finding(
+                        category="Agentforce Script Integrity",
+                        severity="HIGH",
+                        target=f"{bundle_name} -> Post-Action Scope",
+                        file_path=agent_file,
+                        issue="@inputs accessed in post-action 'set' directive. Fails silently at runtime leaving variable unassigned.",
+                        remediation="Use @outputs from action or capture the input into a variable before the action call.",
+                        rule_id="AGENT-BUNDLE-003"
+                    )
+
+                # 4. Identity & AI disclosure check (AGENT-SAFETY-001)
+                system_match = re.search(r'system\s*:\s*\n(?:[ \t]+[^\n]+\n)*', content)
+                if system_match:
+                    sys_block = system_match.group(0).lower()
+                    has_ai_disclosure = any(term in sys_block for term in ["ai", "assistant", "virtual", "automated", "bot"])
+                    if not has_ai_disclosure:
+                        self.add_finding(
+                            category="Agentforce Safety & Governance",
+                            severity="HIGH",
+                            target=f"{bundle_name} -> System Instructions",
+                            file_path=agent_file,
+                            issue="Agent instructions lack mandatory AI disclosure. System instructions must identify agent as an AI/automated assistant.",
+                            remediation="Add clear AI identity disclosure in system instructions (e.g. 'You are an AI virtual assistant...').",
+                            rule_id="AGENT-SAFETY-001"
+                        )
+
+    def audit_flows(self):
+        """FLOW-BULK-001, FLOW-FAULT-001, FLOW-TIMING-001: Audits Salesforce Flows for governor limits, fault paths, and timing."""
+        flows_dir = self.force_app / "flows"
+        if not flows_dir.exists():
+            return
+
+        data_tags = {"recordCreates", "recordUpdates", "recordDeletes", "recordLookups"}
+
+        for flow_file in flows_dir.glob("*.flow-meta.xml"):
+            flow_name = flow_file.stem.replace(".flow-meta", "")
+            root = get_xml_root(flow_file)
+            if root is None:
+                continue
+
+            trigger_type = None
+            for child in root:
+                if strip_ns(child.tag) == "triggerType":
+                    trigger_type = child.text
+
+            loop_elements = {}
+            connectors = {}
+            elem_tag_map = {}
+
+            for child in root:
+                tag = strip_ns(child.tag)
+                elem_name = None
+                has_fault = False
+                is_same_record_update = False
+                targets = []
+
+                for sub in child:
+                    subtag = strip_ns(sub.tag)
+                    if subtag == "name":
+                        elem_name = sub.text
+                    elif subtag == "faultConnector":
+                        has_fault = True
+                    elif subtag == "inputReference" and sub.text == "$Record":
+                        is_same_record_update = True
+                    elif subtag in ["connector", "nextValueConnector", "noMoreValuesConnector"]:
+                        for nsub in sub:
+                            if strip_ns(nsub.tag) == "targetReference":
+                                targets.append(nsub.text)
+                                if subtag == "nextValueConnector":
+                                    loop_elements[elem_name] = nsub.text
+
+                if elem_name:
+                    elem_tag_map[elem_name] = tag
+                    connectors[elem_name] = targets
+
+                # 1. FLOW-FAULT-001: Missing fault connector on data operations
+                if tag in data_tags:
+                    if not has_fault and elem_name:
+                        self.add_finding(
+                            category="Flow Reliability & Exception Handling",
+                            severity="MEDIUM",
+                            target=f"{flow_name} -> {elem_name}",
+                            file_path=flow_file,
+                            issue=f"Flow data element '{elem_name}' lacks a <faultConnector>. Unhandled exceptions will abort the user transaction.",
+                            remediation="Add a fault connector route to handle exceptions gracefully.",
+                            rule_id="FLOW-FAULT-001"
+                        )
+
+                    # 2. FLOW-TIMING-001: Same-record update in after-save flow
+                    if tag == "recordUpdates" and trigger_type == "RecordAfterSave" and is_same_record_update:
+                        self.add_finding(
+                            category="Flow Optimization & Timing",
+                            severity="HIGH",
+                            target=f"{flow_name} -> {elem_name}",
+                            file_path=flow_file,
+                            issue=f"Flow '{flow_name}' executes same-record update ($Record) in RecordAfterSave context. Incurs duplicate DML and re-executes triggers.",
+                            remediation="Convert flow to RecordBeforeSave and assign field updates to $Record directly.",
+                            rule_id="FLOW-TIMING-001"
+                        )
+
+            # 3. FLOW-BULK-001: Trace loops for in-loop DML/SOQL
+            for lname, start_node in loop_elements.items():
+                visited = set()
+                curr = [start_node]
+                while curr:
+                    node = curr.pop()
+                    if node in visited or node == lname:
+                        continue
+                    visited.add(node)
+                    node_tag = elem_tag_map.get(node)
+                    if node_tag in data_tags:
+                        self.add_finding(
+                            category="Flow Architecture & Limits",
+                            severity="CRITICAL",
+                            target=f"{flow_name} -> {node} in Loop '{lname}'",
+                            file_path=flow_file,
+                            issue=f"Flow data operation '{node}' ({node_tag}) is executed inside loop '{lname}'. Vulnerable to 101 SOQL / 150 DML governor limit.",
+                            remediation="Accumulate sObjects in a collection variable and perform a single Create/Update/Delete operation outside the loop.",
+                            rule_id="FLOW-BULK-001"
+                        )
+                    for next_node in connectors.get(node, []):
+                        if next_node not in visited and next_node != lname:
+                            curr.append(next_node)
 
     def audit_lwc_innovations(self):
         lwc_dir = self.force_app / "lwc"
@@ -747,14 +1067,18 @@ class SecurityAuditor:
 
     def run(self):
         print(f"[*] Auditing local metadata at: {self.force_app}...")
+        self.audit_sfdx_project()
         self.audit_profiles_and_permsets()
         self.audit_objects_and_sharing()
+        self.audit_action_overrides()
         self.audit_networks_and_sites()
         self.audit_apex_classes()
         self.audit_enterprise_triggers()
         self.audit_bulkification()
         self.audit_test_quality()
         self.audit_dependency_integrity()
+        self.audit_agentforce_bundles()
+        self.audit_flows()
         self.audit_lwc_innovations()
 
         if self.target_org:
