@@ -738,3 +738,25 @@ class SpecialistAdvisor:
         lines.append(f"\n🔗 OFFICIAL REFERENCE:\n{rule['reference']}\n")
         lines.append("="*75)
         return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Salesforce Specialist Advisor")
+    parser.add_argument("--list-rules", action="store_true", help="List all cataloged specialist rules")
+    parser.add_argument("--explain", type=str, metavar="RULE_ID", help="Explain a specific rule with full diagnostics")
+    args = parser.parse_args()
+
+    if args.list_rules:
+        rules = SpecialistAdvisor.list_rules()
+        print(f"\n{'='*80}")
+        print(f" SALESFORCE SPECIALIST RULES CATALOG ({len(rules)} Rules)")
+        print(f"{'='*80}\n")
+        for rid, r in sorted(rules.items()):
+            print(f"  [{rid:<18}] ({r['severity']:<8}) {r['title']}")
+            print(f"    Category: {r['category']}")
+        print(f"\n{'='*80}\n")
+    elif args.explain:
+        print(SpecialistAdvisor.explain(args.explain))
+    else:
+        parser.print_help()
