@@ -411,6 +411,301 @@ import getSetting from '@salesforce/apex/AppConfig.getDefaultId';""",
     return val;
 }""",
         "reference": "https://owasp.org/www-community/attacks/CSV_Injection"
+    },
+
+    # --------------------------------------------------------------------------
+    # Agentforce & Atlas Reasoning Engine Rules
+    # --------------------------------------------------------------------------
+    "AGENT-INVOC-001": {
+        "title": "Invocable Action Contract & Semantic Description",
+        "category": "Agentforce Backing Logic",
+        "severity": "HIGH",
+        "description": "Apex @InvocableMethod backing an Agentforce action lacks a detailed description or does not follow bulkified List<Request>/List<Response> signature.",
+        "impact": "The Atlas Reasoning Engine relies strictly on invocable method and variable descriptions to select actions and map utterance slots. Missing or low-quality descriptions cause the agent to hallucinate or fail action invocation.",
+        "bad_example": """// BAD: Missing description, Atlas engine cannot infer action purpose
+public class GetOrderAction {
+    @InvocableMethod
+    public static List<String> getOrder(List<String> orderNumbers) { ... }
+}""",
+        "good_example": """// GOOD: Explicit semantic descriptions for Atlas Reasoning Engine
+public with sharing class GetOrderAction {
+    public class Request {
+        @InvocableVariable(label='Order Number' description='The 10-digit order tracking number (e.g. ORD-12345)' required=true)
+        public String orderNumber;
+    }
+    public class Response {
+        @InvocableVariable(label='Order Status' description='Current shipping status: Pending, Shipped, Delivered')
+        public String status;
+    }
+    @InvocableMethod(label='Get Order Status' description='Retrieves shipping status, carrier, and delivery date for a customer order by order number.')
+    public static List<Response> execute(List<Request> requests) { ... }
+}""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_classes_annotation_InvocableMethod.htm"
+    },
+    "AGENT-INVOC-002": {
+        "title": "Multiple Invocable Methods in Single Class",
+        "category": "Agentforce Backing Logic",
+        "severity": "CRITICAL",
+        "description": "An Apex class declares more than one method with the @InvocableMethod annotation.",
+        "impact": "Salesforce Apex compilation and deployment fails with error: 'Only one method per class can be annotated with InvocableMethod'. Actions cannot be resolved by Agentforce.",
+        "bad_example": """public class OrderActions {
+    @InvocableMethod(label='Get Order')
+    public static List<Response> getOrder(List<Request> reqs) { ... }
+
+    @InvocableMethod(label='Cancel Order') // Fails to compile!
+    public static List<Response> cancelOrder(List<Request> reqs) { ... }
+}""",
+        "good_example": """// Split each invocable action into its own dedicated Apex class
+public class GetOrderAction {
+    @InvocableMethod(label='Get Order', description='Retrieves order status by ID.')
+    public static List<Response> execute(List<Request> reqs) { ... }
+}
+public class CancelOrderAction {
+    @InvocableMethod(label='Cancel Order', description='Cancels an existing order by ID.')
+    public static List<Response> execute(List<Request> reqs) { ... }
+}""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_classes_annotation_InvocableMethod.htm"
+    },
+    "AGENT-BUNDLE-001": {
+        "title": "Agentforce Bundle Backing Logic Disconnected",
+        "category": "Agentforce Script Integrity",
+        "severity": "HIGH",
+        "description": "An AiAuthoringBundle (.agent file) references backing logic (e.g. apex://ClassName) that does not exist in the repository.",
+        "impact": "Agent Script validation or preview fails with unresolved action targets, preventing agent deployment and execution.",
+        "bad_example": """actions:
+    check_status: @actions.get_status
+        target: "apex://NonExistentOrderService" # Missing class in force-app/main/default/classes/""",
+        "good_example": """actions:
+    check_status: @actions.get_status
+        target: "apex://OrderServiceAction" # Class exists and compiles with @InvocableMethod""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.agentforce.meta/agentforce/agent_script_overview.htm"
+    },
+
+    # --------------------------------------------------------------------------
+    # Salesforce Enterprise Design Patterns
+    # --------------------------------------------------------------------------
+    "APEX-ENTERPRISE-001": {
+        "title": "Service Layer UI/Trigger Context Coupling",
+        "category": "Enterprise Architecture (SoC)",
+        "severity": "HIGH",
+        "description": "A Service Layer class (*Service.cls) directly references Trigger context variables (Trigger.new, Trigger.old) or UI context (ApexPages).",
+        "impact": "Violates Separation of Concerns (SoC). Coupled service methods cannot be invoked from REST APIs, asynchronous queueables, or Agentforce actions without mocking triggers.",
+        "bad_example": """public class AccountService {
+    public static void applyDiscount() {
+        for (Account a : (List<Account>)Trigger.new) { // Coupled to Trigger context!
+            a.Discount__c = 10;
+        }
+    }
+}""",
+        "good_example": """public with sharing class AccountService {
+    // Pure service method accepts generic collection, callable from Triggers, APIs, or Agentforce
+    public static void applyDiscount(List<Account> accounts) {
+        for (Account a : accounts) {
+            a.Discount__c = 10;
+        }
+        update accounts;
+    }
+}""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_classes_service_layer.htm"
+    },
+    "APEX-SELECTOR-001": {
+        "title": "SOQL Query Missing Security/User Mode",
+        "category": "Selector & Security Pattern",
+        "severity": "HIGH",
+        "description": "A SOQL query in an Apex class does not enforce security mode via WITH USER_MODE or WITH SECURITY_ENFORCED.",
+        "impact": "Queries execute in system mode, potentially returning fields and records the current user or external portal user has no permission to view.",
+        "bad_example": """public List<Account> getActiveAccounts() {
+    return [SELECT Id, Name, SSN__c FROM Account]; // System mode, ignores FLS!
+}""",
+        "good_example": """public List<Account> getActiveAccounts() {
+    return [SELECT Id, Name, SSN__c FROM Account WITH USER_MODE]; // Enforces FLS & CRUD!
+}""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_classes_with_user_mode.htm"
+    },
+
+    # --------------------------------------------------------------------------
+    # Salesforce DX & Metadata Discipline
+    # --------------------------------------------------------------------------
+    "SFDX-VERSION-001": {
+        "title": "Outdated or Divergent API Version",
+        "category": "Salesforce DX Discipline",
+        "severity": "MEDIUM",
+        "description": "Metadata component declares an apiVersion significantly lower than modern standard (>= 58.0, recommended 62.0+).",
+        "impact": "Old API versions lack support for modern platform capabilities (LWS, Dynamic Forms, Assert class) and trigger false deploy rejections in CI pipelines.",
+        "bad_example": """<apiVersion>45.0</apiVersion> <!-- Deprecated legacy version -->""",
+        "good_example": """<apiVersion>62.0</apiVersion> <!-- Modern Winter '25 platform baseline -->""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.sfdx_dev.meta/sfdx_dev/sfdx_dev_source_file_format.htm"
+    },
+    "SFDX-OVERRIDE-001": {
+        "title": "Dangling Action Override",
+        "category": "Metadata Integrity",
+        "severity": "CRITICAL",
+        "description": "CustomObject action override references a LightningComponent or FlexiPage that does not exist in the source tree.",
+        "impact": "Causes fatal deployment errors in scratch orgs and target pipelines (e.g. 'Component does not exist').",
+        "bad_example": """<actionOverrides>
+    <actionName>New</actionName>
+    <content>deletedComponentOverride</content> <!-- Component deleted from repo! -->
+    <type>LightningComponent</type>
+</actionOverrides>""",
+        "good_example": """<!-- Ensure component exists in force-app/main/default/lwc/ or remove override -->""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.object_reference.meta/object_reference/sforce_api_objects_customobject.htm"
+    },
+    "SFDX-FLS-001": {
+        "title": "Non-Contiguous FieldPermissions XML",
+        "category": "Metadata Deployment Integrity",
+        "severity": "HIGH",
+        "description": "A Profile or PermissionSet metadata XML file contains non-contiguous <fieldPermissions> element blocks.",
+        "impact": "Salesforce Metadata API deploy fails with XML parsing errors or rejects split permissions. Hand-editing or bad merge conflict resolution causes this defect.",
+        "bad_example": """<Profile>
+    <fieldPermissions>
+        <editable>true</editable>
+        <field>Account.Active__c</field>
+        <readable>true</readable>
+    </fieldPermissions>
+    <layoutAssignments>...</layoutAssignments>
+    <!-- Non-contiguous! Second fieldPermissions block after layoutAssignments -->
+    <fieldPermissions>
+        <editable>true</editable>
+        <field>Account.Rating</field>
+        <readable>true</readable>
+    </fieldPermissions>
+</Profile>""",
+        "good_example": """<!-- Group all elements of the same type together contiguously -->
+<Profile>
+    <fieldPermissions>
+        <editable>true</editable>
+        <field>Account.Active__c</field>
+        <readable>true</readable>
+    </fieldPermissions>
+    <fieldPermissions>
+        <editable>true</editable>
+        <field>Account.Rating</field>
+        <readable>true</readable>
+    </fieldPermissions>
+    <layoutAssignments>...</layoutAssignments>
+</Profile>""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_profile.htm"
+    },
+    "AGENT-INVOC-003": {
+        "title": "Reserved InvocableVariable Keyword",
+        "category": "Agentforce Backing Logic",
+        "severity": "CRITICAL",
+        "description": "An @InvocableVariable in an Apex class uses a reserved Agent Script keyword ('model', 'description', 'label').",
+        "impact": "Although valid in Apex, this causes 'SyntaxError: Unexpected <keyword>' during Agent Script bundle compilation.",
+        "bad_example": """public class Request {
+    @InvocableVariable(label='Description')
+    public String description; // Reserved keyword in Agent Script!
+}""",
+        "good_example": """public class Request {
+    @InvocableVariable(label='Description')
+    public String issue_description; // Safe non-reserved identifier
+}""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.agentforce.meta/agentforce/agent_script_overview.htm"
+    },
+    "AGENT-BUNDLE-002": {
+        "title": "Agent Script Block Ordering Violation",
+        "category": "Agentforce Script Integrity",
+        "severity": "HIGH",
+        "description": "Top-level blocks in .agent file violate mandatory order (system, config, variables, connection, knowledge, language, start_agent, subagent).",
+        "impact": "Agent Script parser fails compilation with structural syntax errors.",
+        "bad_example": """config:
+    ...
+system: # Wrong! system block must precede config
+    ...""",
+        "good_example": """system:
+    ...
+config:
+    ...
+variables:
+    ...
+start_agent router:
+    ...""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.agentforce.meta/agentforce/agent_script_overview.htm"
+    },
+    "AGENT-BUNDLE-003": {
+        "title": "Agent Script Lifecycle Hook & Scope Misuse",
+        "category": "Agentforce Script Integrity",
+        "severity": "HIGH",
+        "description": "Lifecycle hook (before_reasoning/after_reasoning) wrapped in 'instructions: ->', or @inputs referenced in post-action 'set' directive.",
+        "impact": "Wrapping hooks with instructions causes compile failure. Accessing @inputs in post-action set causes silent runtime drops leaving variables unassigned.",
+        "bad_example": """before_reasoning:
+    instructions: -> # Compile error!
+        set @variables.x = True
+
+# OR post-action @inputs misuse:
+run @actions.do_work
+    with input_val = ...
+    set @variables.val = @inputs.input_val # Fails silently at runtime!""",
+        "good_example": """before_reasoning:
+    set @variables.x = True # Direct statements under hook
+
+run @actions.do_work
+    with input_val = ...
+    set @variables.val = @outputs.result_val # Use @outputs or capture before call""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.agentforce.meta/agentforce/agent_script_overview.htm"
+    },
+    "AGENT-SAFETY-001": {
+        "title": "Agentforce AI Identity Disclosure Missing",
+        "category": "Agentforce Safety & Governance",
+        "severity": "HIGH",
+        "description": "Agent system instructions lack clear AI disclosure or transparent identity guidance.",
+        "impact": "Violates Salesforce Trust and regulatory AI compliance (impersonation risk, lack of transparency).",
+        "bad_example": """system:
+    instructions: ->
+        | You are Sarah, Senior Loan Underwriter at Bank Corp. (No AI disclosure!)""",
+        "good_example": """system:
+    instructions: ->
+        | You are an AI virtual customer assistant helping users navigate their accounts.""",
+        "reference": "https://www.salesforce.com/products/einstein/trust/"
+    },
+
+    # --------------------------------------------------------------------------
+    # Salesforce Flow Best Practices & Governor Limits
+    # --------------------------------------------------------------------------
+    "FLOW-BULK-001": {
+        "title": "Flow Data Element Inside Loop",
+        "category": "Flow Architecture & Limits",
+        "severity": "CRITICAL",
+        "description": "A Salesforce Flow executes record lookups or DML operations (Create, Update, Delete) inside a loop element.",
+        "impact": "Triggers 101 SOQL queries limit or 150 DML statements limit at runtime when processing batches of records.",
+        "bad_example": """<!-- Inside <loops>: recordLookups or recordUpdates chained in nextValueConnector -->""",
+        "good_example": """<!-- Loop assigns records to collection variable; single recordCreates/recordUpdates outside loop -->""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.salesforce_flow_limits.meta/salesforce_flow_limits/"
+    },
+    "FLOW-FAULT-001": {
+        "title": "Flow Data Element Missing Fault Path",
+        "category": "Flow Reliability & Exception Handling",
+        "severity": "MEDIUM",
+        "description": "A Flow record manipulation element lacks a <faultConnector> path.",
+        "impact": "Any validation rule, trigger error, or lock contention causes an unhandled flow fault that crashes the user transaction.",
+        "bad_example": """<recordUpdates>
+    <name>Update_Account</name>
+    <!-- Missing <faultConnector>! -->
+</recordUpdates>""",
+        "good_example": """<recordUpdates>
+    <name>Update_Account</name>
+    <faultConnector>
+        <targetReference>Log_Flow_Error</targetReference>
+    </faultConnector>
+</recordUpdates>""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.salesforce_flow_limits.meta/salesforce_flow_limits/"
+    },
+    "FLOW-TIMING-001": {
+        "title": "Same-Record Update in After-Save Flow",
+        "category": "Flow Optimization & Timing",
+        "severity": "HIGH",
+        "description": "Record-triggered Flow performs update on $Record in an after-save context (RecordAfterSave).",
+        "impact": "Causes duplicate DML transaction and re-invokes Apex triggers. 10x performance penalty compared to before-save.",
+        "bad_example": """<!-- Flow triggerType: RecordAfterSave -->
+<recordUpdates>
+    <inputReference>$Record</inputReference>
+</recordUpdates>""",
+        "good_example": """<!-- Flow triggerType: RecordBeforeSave -->
+<assignments>
+    <assignToReference>$Record.Status__c</assignToReference>
+    <value><stringValue>Active</stringValue></value>
+</assignments>""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.salesforce_flow_limits.meta/salesforce_flow_limits/"
     }
 }
 

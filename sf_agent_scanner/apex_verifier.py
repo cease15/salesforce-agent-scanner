@@ -481,11 +481,193 @@ class ApexVerifier:
                             remediation="Pass List<Id> of records instead of sObject instances, or refactor to Queueable Apex (implements Queueable)."
                         )
 
+    # --------------------------------------------------------------------------
+    # 6. Agentforce & Invocable Actions
+    # --------------------------------------------------------------------------
+    def verify_agentforce_and_invocables(self):
+        """Validates Agentforce backing logic contracts: @InvocableMethod single entry, bulkified I/O, descriptions."""
+        if not self.classes_dir.exists():
+            return
+
+        for cls_file in self.classes_dir.glob("*.cls"):
+            try:
+                content = cls_file.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            if "@isTest" in content or "testMethod" in content:
+                continue
+
+            clean = self.strip_comments(content)
+            if "@InvocableMethod" not in clean and "@invocablemethod" not in clean.lower():
+                continue
+
+            # 1. AGENT-INVOC-002: Multiple @InvocableMethod in a single class
+            invoc_matches = list(re.finditer(r'@InvocableMethod\s*(?:\((.*?)\))?', clean, re.IGNORECASE | re.DOTALL))
+            if len(invoc_matches) > 1:
+                self.add_finding(
+                    rule_id="AGENT-INVOC-002",
+                    category="Agentforce Backing Logic",
+                    severity="CRITICAL",
+                    target=cls_file.stem,
+                    file_path=cls_file,
+                    line_num=content[:invoc_matches[1].start()].count('\n') + 1,
+                    issue=f"Apex class '{cls_file.stem}' declares {len(invoc_matches)} @InvocableMethod methods. Salesforce compilation permits only one @InvocableMethod per class.",
+                    remediation="Split each invocable action into its own dedicated Apex class."
+                )
+
+            # 2. AGENT-INVOC-001: Missing description or non-bulkified signature
+            for im in invoc_matches:
+                attr_str = im.group(1) or ""
+                im_line = content[:im.start()].count('\n') + 1
+
+                # Check description
+                desc_match = re.search(r'\bdescription\s*=\s*[\'"]([^\'"]+)[\'"]', attr_str, re.IGNORECASE)
+                if not desc_match or not desc_match.group(1).strip():
+                    self.add_finding(
+                        rule_id="AGENT-INVOC-001",
+                        category="Agentforce Backing Logic",
+                        severity="HIGH",
+                        target=f"{cls_file.stem} (@InvocableMethod)",
+                        file_path=cls_file,
+                        line_num=im_line,
+                        issue=f"@InvocableMethod in '{cls_file.stem}' lacks a detailed 'description' attribute. The Atlas Reasoning Engine requires semantic descriptions to match user utterances to actions.",
+                        remediation="Add description='...' with clear explanation of the action's purpose and expected outcome."
+                    )
+
+                # Check method signature following the annotation
+                after_im = clean[im.end():]
+                meth_decl = re.search(
+                    r'(?:public|global)\s+static\s+([\w<>\[\],\s]+?)\s+(\w+)\s*\(([^)]*)\)',
+                    after_im,
+                    re.IGNORECASE
+                )
+                if meth_decl:
+                    ret_type = meth_decl.group(1).strip()
+                    method_name = meth_decl.group(2).strip()
+                    param_str = meth_decl.group(3).strip()
+
+                    # Return type check: must be List<...> or void
+                    if not (ret_type.startswith("List<") or ret_type == "void"):
+                        self.add_finding(
+                            rule_id="AGENT-INVOC-001",
+                            category="Agentforce Backing Logic",
+                            severity="HIGH",
+                            target=f"{cls_file.stem}.{method_name}",
+                            file_path=cls_file,
+                            line_num=im_line,
+                            issue=f"Invocable method '{method_name}' returns non-bulkified type '{ret_type}'. Invocable actions must return List<Response> or List<Primitive>.",
+                            remediation="Wrap the return type in a List (e.g. List<Response> or List<String>)."
+                        )
+
+                    # Parameter check: must accept single parameter of List<...>
+                    if param_str:
+                        if "," in param_str or not param_str.strip().startswith("List<"):
+                            self.add_finding(
+                                rule_id="AGENT-INVOC-001",
+                                category="Agentforce Backing Logic",
+                                severity="HIGH",
+                                target=f"{cls_file.stem}.{method_name}",
+                                file_path=cls_file,
+                                line_num=im_line,
+                                issue=f"Invocable method '{method_name}' accepts '{param_str}'. Invocable actions must accept a single List<Request> parameter for bulkification.",
+                                remediation="Encapsulate method inputs into a single inner Request class and accept List<Request>."
+                            )
+
+            # Check @InvocableVariable in inner classes
+            invoc_vars = list(re.finditer(r'@InvocableVariable\s*(?:\((.*?)\))?\s*(?:public|global)?\s+[\w<>\[\]]+\s+(\w+)\s*;', clean, re.IGNORECASE | re.DOTALL))
+            for iv in invoc_vars:
+                attr_str = iv.group(1) or ""
+                var_name = iv.group(2)
+                var_line = content[:iv.start()].count('\n') + 1
+
+                # Reserved keyword check (AGENT-INVOC-003)
+                if var_name.lower() in {"model", "description", "label"}:
+                    self.add_finding(
+                        rule_id="AGENT-INVOC-003",
+                        category="Agentforce Backing Logic",
+                        severity="CRITICAL",
+                        target=f"{cls_file.stem}.{var_name}",
+                        file_path=cls_file,
+                        line_num=var_line,
+                        issue=f"@InvocableVariable field '{var_name}' uses a reserved Agent Script keyword ('model', 'description', 'label'). Causes 'SyntaxError: Unexpected {var_name}' during Agent Script compilation.",
+                        remediation=f"Rename '{var_name}' to e.g. '{var_name}_val' or '{var_name}_text' to avoid collision with Agent Script parser keywords."
+                    )
+
+                desc_match = re.search(r'\bdescription\s*=\s*[\'"]([^\'"]+)[\'"]', attr_str, re.IGNORECASE)
+                if not desc_match or not desc_match.group(1).strip():
+                    self.add_finding(
+                        rule_id="AGENT-INVOC-001",
+                        category="Agentforce Backing Logic",
+                        severity="MEDIUM",
+                        target=f"{cls_file.stem}.{var_name}",
+                        file_path=cls_file,
+                        line_num=var_line,
+                        issue=f"@InvocableVariable '{var_name}' in '{cls_file.stem}' lacks a 'description' attribute. Atlas Reasoning Engine uses field descriptions for slot extraction from user input.",
+                        remediation="Add description='...' attribute with field purpose, format guidelines, and examples."
+                    )
+
+    # --------------------------------------------------------------------------
+    # 7. Enterprise Architecture & Separation of Concerns (SoC)
+    # --------------------------------------------------------------------------
+    def verify_enterprise_architecture(self):
+        """Verifies Service Layer decoupling and Selector query security modes."""
+        if not self.classes_dir.exists():
+            return
+
+        for cls_file in self.classes_dir.glob("*.cls"):
+            try:
+                content = cls_file.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            if "@isTest" in content or "testMethod" in content:
+                continue
+
+            clean = self.strip_comments(content)
+
+            # 1. APEX-ENTERPRISE-001: Service Layer decoupling
+            if cls_file.stem.endswith("Service"):
+                coupled_context = re.search(r'\b(Trigger\.(new|old|newMap|oldMap|isInsert|isUpdate|isDelete|isBefore|isAfter)|ApexPages\.currentPage\(\)|ApexPages\.addMessage\b)', clean, re.IGNORECASE)
+                if coupled_context:
+                    line_num = content[:coupled_context.start()].count('\n') + 1
+                    self.add_finding(
+                        rule_id="APEX-ENTERPRISE-001",
+                        category="Enterprise Architecture (SoC)",
+                        severity="HIGH",
+                        target=cls_file.stem,
+                        file_path=cls_file,
+                        line_num=line_num,
+                        issue=f"Service Layer class '{cls_file.stem}' references caller context '{coupled_context.group(0)}'. Violates Separation of Concerns.",
+                        remediation="Service methods must accept generic collections (List/Set/Map) and remain caller-agnostic so they can be invoked from Triggers, REST APIs, or Agentforce."
+                    )
+
+            # 2. APEX-SELECTOR-001: Selector query security mode
+            if cls_file.stem.endswith("Selector"):
+                queries = re.finditer(r'\[\s*SELECT\b([^\]]+)\]', clean, re.IGNORECASE)
+                for q in queries:
+                    q_text = q.group(0)
+                    has_security = bool(re.search(r'\bWITH\s+(USER_MODE|SYSTEM_MODE|SECURITY_ENFORCED)\b', q_text, re.IGNORECASE))
+                    if not has_security:
+                        q_line = content[:q.start()].count('\n') + 1
+                        self.add_finding(
+                            rule_id="APEX-SELECTOR-001",
+                            category="Selector & Security Pattern",
+                            severity="HIGH",
+                            target=f"{cls_file.stem} (SOQL Query)",
+                            file_path=cls_file,
+                            line_num=q_line,
+                            issue=f"SOQL query in Selector class '{cls_file.stem}' lacks security mode enforcement (WITH USER_MODE or WITH SECURITY_ENFORCED).",
+                            remediation="Append 'WITH USER_MODE' to enforce Object CRUD and Field-Level Security permissions at query execution time."
+                        )
+
     def run_all(self):
         self.verify_triggers()
         self.verify_bulkification()
         self.verify_sharing_and_security()
         self.verify_runtime_and_exceptions()
+        self.verify_agentforce_and_invocables()
+        self.verify_enterprise_architecture()
         self.verify_test_quality()
         self.verify_live_org_coverage()
         return self.findings

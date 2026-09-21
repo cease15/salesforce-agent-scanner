@@ -105,6 +105,104 @@ class TestApexVerifier(unittest.TestCase):
         findings = verifier.run_all()
         self.assertEqual(len(findings), 0)
 
+    def test_invocable_missing_description(self):
+        apex_code = """
+        public with sharing class InvocableActionNoDesc {
+            @InvocableMethod(label='Execute Action')
+            public static List<String> runAction(List<String> inputs) {
+                return inputs;
+            }
+        }
+        """
+        cls_file = self.classes_dir / "InvocableActionNoDesc.cls"
+        cls_file.write_text(apex_code)
+
+        verifier = ApexVerifier(repo_dir=self.root)
+        findings = verifier.run_all()
+        invoc_findings = [f for f in findings if f.get("rule_id") == "AGENT-INVOC-001"]
+        self.assertTrue(len(invoc_findings) > 0)
+        self.assertEqual(invoc_findings[0].get("severity"), "HIGH")
+
+    def test_invocable_multiple_methods(self):
+        apex_code = """
+        public with sharing class MultipleInvocablesClass {
+            @InvocableMethod(label='Action One', description='Does thing one')
+            public static List<String> actionOne(List<String> inputs) {
+                return inputs;
+            }
+            @InvocableMethod(label='Action Two', description='Does thing two')
+            public static List<String> actionTwo(List<String> inputs) {
+                return inputs;
+            }
+        }
+        """
+        cls_file = self.classes_dir / "MultipleInvocablesClass.cls"
+        cls_file.write_text(apex_code)
+
+        verifier = ApexVerifier(repo_dir=self.root)
+        findings = verifier.run_all()
+        invoc2_findings = [f for f in findings if f.get("rule_id") == "AGENT-INVOC-002"]
+        self.assertTrue(len(invoc2_findings) > 0)
+        self.assertEqual(invoc2_findings[0].get("severity"), "CRITICAL")
+
+    def test_service_layer_trigger_coupling(self):
+        apex_code = """
+        public with sharing class AccountService {
+            public static void updateAccounts() {
+                for (Account acc : (List<Account>)Trigger.new) {
+                    acc.Rating = 'Hot';
+                }
+            }
+        }
+        """
+        cls_file = self.classes_dir / "AccountService.cls"
+        cls_file.write_text(apex_code)
+
+        verifier = ApexVerifier(repo_dir=self.root)
+        findings = verifier.run_all()
+        service_findings = [f for f in findings if f.get("rule_id") == "APEX-ENTERPRISE-001"]
+        self.assertTrue(len(service_findings) > 0)
+        self.assertEqual(service_findings[0].get("severity"), "HIGH")
+
+    def test_selector_missing_user_mode(self):
+        apex_code = """
+        public with sharing class OpportunitySelector {
+            public static List<Opportunity> getOpenOpportunities() {
+                return [SELECT Id, Name, Amount FROM Opportunity WHERE StageName != 'Closed Won'];
+            }
+        }
+        """
+        cls_file = self.classes_dir / "OpportunitySelector.cls"
+        cls_file.write_text(apex_code)
+
+        verifier = ApexVerifier(repo_dir=self.root)
+        findings = verifier.run_all()
+        selector_findings = [f for f in findings if f.get("rule_id") == "APEX-SELECTOR-001"]
+        self.assertTrue(len(selector_findings) > 0)
+        self.assertEqual(selector_findings[0].get("severity"), "HIGH")
+
+    def test_invocable_reserved_keyword(self):
+        apex_code = """
+        public with sharing class InvocableWithReservedVar {
+            public class Request {
+                @InvocableVariable(label='Model Info', description='Car model')
+                public String model;
+            }
+            @InvocableMethod(label='Get Model', description='Retrieves model information')
+            public static List<String> getModel(List<Request> reqs) {
+                return new List<String>();
+            }
+        }
+        """
+        cls_file = self.classes_dir / "InvocableWithReservedVar.cls"
+        cls_file.write_text(apex_code)
+
+        verifier = ApexVerifier(repo_dir=self.root)
+        findings = verifier.run_all()
+        reserved_findings = [f for f in findings if f.get("rule_id") == "AGENT-INVOC-003"]
+        self.assertTrue(len(reserved_findings) > 0)
+        self.assertEqual(reserved_findings[0].get("severity"), "CRITICAL")
+
 
 class TestLwcVerifier(unittest.TestCase):
     def setUp(self):
@@ -250,6 +348,174 @@ class TestSpecialistAdvisor(unittest.TestCase):
         self.assertIn("APEX-BULK-001", rules)
         self.assertIn("LWC-DOM-001", rules)
         self.assertIn("LWC-GETTER-MUTATE", rules)
+        self.assertIn("AGENT-INVOC-001", rules)
+        self.assertIn("AGENT-INVOC-002", rules)
+        self.assertIn("APEX-ENTERPRISE-001", rules)
+        self.assertIn("APEX-SELECTOR-001", rules)
+        self.assertIn("SFDX-OVERRIDE-001", rules)
+        self.assertIn("SFDX-FLS-001", rules)
+        self.assertIn("AGENT-INVOC-003", rules)
+        self.assertIn("AGENT-BUNDLE-002", rules)
+        self.assertIn("AGENT-BUNDLE-003", rules)
+        self.assertIn("AGENT-SAFETY-001", rules)
+        self.assertIn("FLOW-BULK-001", rules)
+        self.assertIn("FLOW-FAULT-001", rules)
+        self.assertIn("FLOW-TIMING-001", rules)
+
+
+class TestMetadataSecurity(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.default_dir = self.root / "force-app" / "main" / "default"
+        self.default_dir.mkdir(parents=True)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_dangling_action_override(self):
+        obj_dir = self.default_dir / "objects" / "Quote__c"
+        obj_dir.mkdir(parents=True)
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <actionOverrides>
+        <actionName>New</actionName>
+        <content>nonExistentLwcOverride</content>
+        <type>LightningComponent</type>
+    </actionOverrides>
+</CustomObject>
+"""
+        (obj_dir / "Quote__c.object-meta.xml").write_text(xml_content)
+
+        auditor = SecurityAuditor(repo_dir=self.root)
+        findings = auditor.run_audit()
+        override_findings = [f for f in findings if f.get("rule_id") == "SFDX-OVERRIDE-001"]
+        self.assertTrue(len(override_findings) > 0)
+        self.assertEqual(override_findings[0].get("severity"), "CRITICAL")
+
+    def test_non_contiguous_field_permissions(self):
+        profiles_dir = self.default_dir / "profiles"
+        profiles_dir.mkdir(parents=True)
+        profile_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<Profile xmlns="http://soap.sforce.com/2006/04/metadata">
+    <custom>true</custom>
+    <fieldPermissions>
+        <editable>true</editable>
+        <field>Account.Active__c</field>
+        <readable>true</readable>
+    </fieldPermissions>
+    <userPermissions>
+        <enabled>true</enabled>
+        <name>ApiEnabled</name>
+    </userPermissions>
+    <fieldPermissions>
+        <editable>true</editable>
+        <field>Account.Rating</field>
+        <readable>true</readable>
+    </fieldPermissions>
+</Profile>
+"""
+        (profiles_dir / "SplitProfile.profile-meta.xml").write_text(profile_xml)
+
+        auditor = SecurityAuditor(repo_dir=self.root)
+        findings = auditor.run_audit()
+        fls_findings = [f for f in findings if f.get("rule_id") == "SFDX-FLS-001"]
+        self.assertTrue(len(fls_findings) > 0)
+        self.assertEqual(fls_findings[0].get("severity"), "HIGH")
+
+    def test_sfdx_outdated_api_version(self):
+        sfdx_proj = self.root / "sfdx-project.json"
+        sfdx_proj.write_text('{"sourceApiVersion": "45.0"}')
+
+        auditor = SecurityAuditor(repo_dir=self.root)
+        findings = auditor.run_audit()
+        ver_findings = [f for f in findings if f.get("rule_id") == "SFDX-VERSION-001"]
+        self.assertTrue(len(ver_findings) > 0)
+        self.assertEqual(ver_findings[0].get("severity"), "MEDIUM")
+
+    def test_agentforce_bundle_missing_logic(self):
+        bundle_dir = self.default_dir / "aiAuthoringBundles" / "TestAgent"
+        bundle_dir.mkdir(parents=True)
+        agent_script = """
+start_agent router:
+    reasoning:
+        actions:
+            lookup: @actions.lookup_action
+                target: "apex://NonExistentBackingClass"
+"""
+        (bundle_dir / "TestAgent.agent").write_text(agent_script)
+
+        auditor = SecurityAuditor(repo_dir=self.root)
+        findings = auditor.run_audit()
+        bundle_findings = [f for f in findings if f.get("rule_id") == "AGENT-BUNDLE-001"]
+        self.assertTrue(len(bundle_findings) > 0)
+        self.assertEqual(bundle_findings[0].get("severity"), "HIGH")
+
+    def test_agentforce_bundle_ordering_and_hooks(self):
+        bundle_dir = self.default_dir / "aiAuthoringBundles" / "BadOrderAgent"
+        bundle_dir.mkdir(parents=True)
+        agent_script = """
+config:
+    developer_name: "test"
+system:
+    instructions: ->
+        | Hello user
+start_agent router:
+    before_reasoning:
+        instructions: ->
+            set @variables.x = True
+    reasoning:
+        instructions: ->
+            | Route message
+"""
+        (bundle_dir / "BadOrderAgent.agent").write_text(agent_script)
+
+        auditor = SecurityAuditor(repo_dir=self.root)
+        findings = auditor.run_audit()
+        order_findings = [f for f in findings if f.get("rule_id") == "AGENT-BUNDLE-002"]
+        hook_findings = [f for f in findings if f.get("rule_id") == "AGENT-BUNDLE-003"]
+        safety_findings = [f for f in findings if f.get("rule_id") == "AGENT-SAFETY-001"]
+        self.assertTrue(len(order_findings) > 0)
+        self.assertTrue(len(hook_findings) > 0)
+        self.assertTrue(len(safety_findings) > 0)
+
+    def test_flow_bulk_and_fault_checks(self):
+        flows_dir = self.default_dir / "flows"
+        flows_dir.mkdir(parents=True)
+        flow_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <triggerType>RecordAfterSave</triggerType>
+    <recordUpdates>
+        <name>Update_Triggering_Record</name>
+        <inputReference>$Record</inputReference>
+    </recordUpdates>
+    <loops>
+        <name>Loop_Accounts</name>
+        <nextValueConnector>
+            <targetReference>Create_Account_Task</targetReference>
+        </nextValueConnector>
+    </loops>
+    <recordCreates>
+        <name>Create_Account_Task</name>
+        <connector>
+            <targetReference>Loop_Accounts</targetReference>
+        </connector>
+    </recordCreates>
+</Flow>
+"""
+        (flows_dir / "BadFlow.flow-meta.xml").write_text(flow_xml)
+
+        auditor = SecurityAuditor(repo_dir=self.root)
+        findings = auditor.run_audit()
+        bulk_findings = [f for f in findings if f.get("rule_id") == "FLOW-BULK-001"]
+        fault_findings = [f for f in findings if f.get("rule_id") == "FLOW-FAULT-001"]
+        timing_findings = [f for f in findings if f.get("rule_id") == "FLOW-TIMING-001"]
+        self.assertTrue(len(bulk_findings) > 0)
+        self.assertTrue(len(fault_findings) > 0)
+        self.assertTrue(len(timing_findings) > 0)
+        self.assertEqual(bulk_findings[0].get("severity"), "CRITICAL")
+        self.assertEqual(timing_findings[0].get("severity"), "HIGH")
+
 
 if __name__ == "__main__":
     unittest.main()
