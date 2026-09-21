@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sf-agent-scanner"
+version = "1.0.0"
+authors = [
+  { name = "cease15", email = "cease15@gmail.com" }
+]
+description = "Universal compiler-grade scanner and quality gate for Salesforce Apex, LWC, and Metadata Security across all CI/CD pipelines."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Software Development :: Quality Assurance",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = []
+
+[project.scripts]
+sf-agent-scan = "sf_agent_scanner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sf_agent_scanner*"]

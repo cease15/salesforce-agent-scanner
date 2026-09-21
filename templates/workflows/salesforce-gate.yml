@@ -1,0 +1,38 @@
+name: 'Salesforce Specialist Agent Quality & Security Gate'
+
+on:
+  pull_request:
+    branches: [main, develop, uat]
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+jobs:
+  salesforce-quality-gate:
+    name: Salesforce Specialist Agent Quality Gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+      checks: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Salesforce Specialist Agent Scanner
+        uses: cease15/salesforce-agent-scanner@v1
+        with:
+          scope: all
+          strict: 'true'
+          sarif-file: 'sf-agent-scanner.sarif'
+          junit-file: 'sf-agent-scanner-junit.xml'
+          upload-sarif: 'true'
+
+      - name: Publish Test Results (JUnit)
+        if: always()
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        continue-on-error: true
+        with:
+          files: 'sf-agent-scanner-junit.xml'
+          check_name: Salesforce Specialist Agent Test Summary

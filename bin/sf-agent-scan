@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+import sys
+import os
+from pathlib import Path
+
+# Add package directory to sys.path
+package_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(package_root))
+
+from sf_agent_scanner.cli import main
+
+if __name__ == "__main__":
+    main()

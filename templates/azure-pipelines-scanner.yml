@@ -1,0 +1,71 @@
+# Azure DevOps Pipeline Template: Salesforce Specialist Agent Quality Gate
+# Include in your azure-pipelines.yml via:
+#   extends:
+#     template: templates/azure-pipelines-scanner.yml
+
+parameters:
+  - name: repoDir
+    type: string
+    default: '.'
+  - name: scope
+    type: string
+    default: 'all'
+    values:
+      - 'all'
+      - 'apex'
+      - 'lwc'
+      - 'security'
+  - name: strict
+    type: boolean
+    default: true
+  - name: targetOrg
+    type: string
+    default: ''
+
+steps:
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.x'
+      addToPath: true
+    displayName: 'Setup Python 3'
+
+  - bash: |
+      set -euo pipefail
+      echo "Installing Salesforce Specialist Agent Scanner..."
+      curl -sSL https://raw.githubusercontent.com/cease15/salesforce-agent-scanner/main/install.sh | bash
+      echo "##vso[task.prependpath]$HOME/.local/bin"
+    displayName: 'Install Salesforce Specialist Agent Scanner'
+
+  - bash: |
+      set -euo pipefail
+      mkdir -p $(Build.ArtifactStagingDirectory)/reports
+      
+      ARGS=(
+        "--repo-dir" "${{ parameters.repoDir }}"
+        "--scope" "${{ parameters.scope }}"
+        "--junit" "$(Build.ArtifactStagingDirectory)/reports/sf-agent-scanner-junit.xml"
+        "--sarif" "$(Build.ArtifactStagingDirectory)/reports/sf-agent-scanner.sarif"
+        "--ado"
+      )
+
+      if [ "${{ parameters.strict }}" = "True" ]; then
+        ARGS+=("--strict")
+      else
+        ARGS+=("--no-strict")
+      fi
+
+      if [ -n "${{ parameters.targetOrg }}" ]; then
+        ARGS+=("--target-org" "${{ parameters.targetOrg }}")
+      fi
+
+      sf-agent-scan "${ARGS[@]}"
+    displayName: 'Execute Salesforce Specialist Agent Quality Gate'
+
+  - task: PublishTestResults@2
+    condition: always()
+    inputs:
+      testResultsFormat: 'JUnit'
+      testResultsFiles: '$(Build.ArtifactStagingDirectory)/reports/sf-agent-scanner-junit.xml'
+      testRunTitle: 'Salesforce Specialist Agent Quality & Security Gate'
+      failTaskOnFailedTests: ${{ parameters.strict }}
+    displayName: 'Publish Quality Gate Test Results'

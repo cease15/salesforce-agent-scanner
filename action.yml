@@ -1,0 +1,79 @@
+name: 'Salesforce Specialist Agent Quality & Security Gate'
+description: 'Universal compiler-grade scanner and quality gate for Salesforce Apex, LWC, and Metadata Security across all CI/CD pipelines.'
+author: 'cease15'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  repo-dir:
+    description: 'Root directory of the Salesforce repository'
+    required: false
+    default: '.'
+  scope:
+    description: 'Scan scope: all, apex, lwc, or security'
+    required: false
+    default: 'all'
+  strict:
+    description: 'Enforce failure (exit code 1) on critical/high findings'
+    required: false
+    default: 'true'
+  target-org:
+    description: 'Optional Salesforce target org alias for live Tooling API coverage checks'
+    required: false
+    default: ''
+  sarif-file:
+    description: 'Output path for SARIF 2.1.0 report'
+    required: false
+    default: 'sf-agent-scanner.sarif'
+  junit-file:
+    description: 'Output path for JUnit XML report'
+    required: false
+    default: 'sf-agent-scanner-junit.xml'
+  upload-sarif:
+    description: 'Upload SARIF report to GitHub Advanced Security / Code Scanning'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Ensure Python 3
+      shell: bash
+      run: |
+        if ! command -v python3 >/dev/null 2>&1; then
+          echo "::error::Python 3 is required but not installed."
+          exit 1
+        fi
+        echo "Python version: $(python3 --version)"
+
+    - name: Run Salesforce Specialist Agent Scanner
+      shell: bash
+      run: |
+        ARGS=(
+          "--repo-dir" "${{ inputs.repo-dir }}"
+          "--scope" "${{ inputs.scope }}"
+          "--sarif" "${{ inputs.sarif-file }}"
+          "--junit" "${{ inputs.junit-file }}"
+        )
+        if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+          ARGS+=("--summary-md" "$GITHUB_STEP_SUMMARY")
+        fi
+        if [ "${{ inputs.strict }}" = "true" ]; then
+          ARGS+=("--strict")
+        else
+          ARGS+=("--no-strict")
+        fi
+        if [ -n "${{ inputs.target-org }}" ]; then
+          ARGS+=("--target-org" "${{ inputs.target-org }}")
+        fi
+
+        python3 "${{ github.action_path }}/bin/sf-agent-scan" "${ARGS[@]}"
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: ${{ inputs.upload-sarif == 'true' && !cancelled() }}
+      uses: github/codeql-action/upload-sarif@v3
+      continue-on-error: true
+      with:
+        sarif_file: ${{ inputs.sarif-file }}
+        category: sf-agent-scanner

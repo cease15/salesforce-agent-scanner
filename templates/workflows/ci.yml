@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Unit Tests & Package Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify CLI Executable
+        run: |
+          chmod +x bin/sf-agent-scan install.sh
+          ./bin/sf-agent-scan --help
+
+      - name: Run Test Suite
+        run: |
+          python3 -m unittest discover -s tests -v
+
+      - name: Self-Scan
+        run: |
+          ./bin/sf-agent-scan --repo-dir . --all --no-strict --junit test-results.xml
