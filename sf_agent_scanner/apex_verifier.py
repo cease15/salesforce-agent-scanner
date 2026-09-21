@@ -60,6 +60,11 @@ class ApexVerifier:
         )
         return re.sub(pattern, replacer, content)
 
+    def strip_comments_only(self, content):
+        """Strips single-line and multi-line comments while preserving string literals."""
+        pattern = re.compile(r"//.*?$|/\*.*?\*/", re.DOTALL | re.MULTILINE)
+        return re.sub(pattern, " ", content)
+
     # --------------------------------------------------------------------------
     # 1. Trigger Architecture
     # --------------------------------------------------------------------------
@@ -274,6 +279,7 @@ class ApexVerifier:
                 continue
 
             clean = self.strip_comments(content)
+            comments_only = self.strip_comments_only(content)
 
             # seeAllData=true
             see_all_data_match = re.search(r'seeAllData\s*=\s*true', clean, re.IGNORECASE)
@@ -291,9 +297,9 @@ class ApexVerifier:
                 )
 
             # Hardcoded usernames
-            user_match = re.search(r'[\'"][a-zA-Z0-9._%+-]+@deltaportal\.test\.\w+[\'"]', clean)
+            user_match = re.search(r'[\'"][a-zA-Z0-9._%+-]+@deltaportal\.test\.\w+[\'"]', comments_only)
             if not user_match:
-                user_match = re.search(r'[\'"][a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.sandbox[\'"]', clean)
+                user_match = re.search(r'[\'"][a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.sandbox[\'"]', comments_only)
             if user_match:
                 line_num = content[:user_match.start()].count('\n') + 1
                 self.add_finding(
@@ -323,28 +329,122 @@ class ApexVerifier:
                         remediation="Add meaningful assertions using modern System.Assert (Assert.areEqual, Assert.isTrue) to verify behavior."
                     )
 
+            # APEX-TEST-004: Hardcoded Salesforce Record IDs
+            id_matches = list(re.finditer(r'[\'"]((?:001|003|005|006|00D|00e|012|01p|01q|a0[0-9a-zA-Z])[0-9a-zA-Z]{12}(?:[0-9a-zA-Z]{3})?)[\'"]', comments_only))
+            for id_m in id_matches:
+                found_id = id_m.group(1)
+                id_line = content[:id_m.start()].count('\n') + 1
+                self.add_finding(
+                    rule_id="APEX-TEST-004",
+                    category="Test Quality & Portability",
+                    severity="HIGH",
+                    target=f"{cls_file.stem} ({found_id})",
+                    file_path=cls_file,
+                    line_num=id_line,
+                    issue=f"Test class contains hardcoded Salesforce Record ID '{found_id}'. Hardcoded IDs fail across sandboxes and scratch orgs.",
+                    remediation="Retrieve IDs dynamically via SOQL, Schema.describe (e.g. getRecordTypeInfosByDeveloperName), or create test records in @testSetup."
+                )
+
+            # APEX-TEST-008: Meaningless Assertion Fluff
+            fluff_matches = list(re.finditer(r'\b(System\.assert\s*\(\s*true\b|Assert\.isTrue\s*\(\s*true\b|System\.assertEquals\s*\(\s*true\s*,\s*true\b|System\.assertEquals\s*\(\s*(\d+)\s*,\s*\2\b|Assert\.areEqual\s*\(\s*(\d+)\s*,\s*\3\b)', clean))
+            for fl_m in fluff_matches:
+                fl_line = content[:fl_m.start()].count('\n') + 1
+                self.add_finding(
+                    rule_id="APEX-TEST-008",
+                    category="Test Quality & Portability",
+                    severity="HIGH",
+                    target=cls_file.stem,
+                    file_path=cls_file,
+                    line_num=fl_line,
+                    issue=f"Meaningless assertion fluff detected: '{fl_m.group(0).strip()}'. Tautological assertions bypass quality gates without verifying logic.",
+                    remediation="Assert on actual business fields, returned values, or database changes resulting from the execution under test."
+                )
+
+            # APEX-TEST-005: Missing Test.startTest() / Test.stopTest() Boundary
+            test_methods = list(re.finditer(r'(@isTest|static\s+testMethod)\s+(?:static\s+void|void)\s+(\w+)\s*\([^)]*\)\s*\{', clean, re.IGNORECASE))
+            has_setup_method = "@testSetup" in clean or "@testsetup" in clean.lower()
+            methods_with_dml = 0
+            
+            for tm in test_methods:
+                m_name = tm.group(2)
+                m_start = tm.start()
+                m_sub = clean[m_start:m_start+2500]
+                has_async = bool(re.search(r'\b(enqueueJob|executeBatch|System\.schedule)\b', m_sub))
+                if has_async and not ("Test.startTest" in m_sub and "Test.stopTest" in m_sub):
+                    m_line = content[:m_start].count('\n') + 1
+                    self.add_finding(
+                        rule_id="APEX-TEST-005",
+                        category="Test Quality & Portability",
+                        severity="MEDIUM",
+                        target=f"{cls_file.stem}.{m_name}",
+                        file_path=cls_file,
+                        line_num=m_line,
+                        issue=f"Test method '{m_name}' invokes asynchronous processing without Test.startTest() / Test.stopTest() boundaries.",
+                        remediation="Enclose asynchronous calls in Test.startTest() and Test.stopTest() to reset governor limits and force synchronous completion."
+                    )
+                if re.search(r'\b(insert\s+|Database\.insert\s*\(|update\s+|Database\.update\s*\()', m_sub):
+                    methods_with_dml += 1
+
+            # APEX-TEST-006: Missing @testSetup Data Factory Pattern
+            if len(test_methods) >= 3 and methods_with_dml >= 2 and not has_setup_method:
+                self.add_finding(
+                    rule_id="APEX-TEST-006",
+                    category="Test Performance & Data Architecture",
+                    severity="MEDIUM",
+                    target=cls_file.stem,
+                    file_path=cls_file,
+                    line_num=1,
+                    issue=f"Test class '{cls_file.stem}' defines {len(test_methods)} test methods with repetitive DML setup without a @testSetup method.",
+                    remediation="Refactor shared record creation into a static @testSetup method to reduce execution time and avoid redundant DML operations."
+                )
+
+            # APEX-TEST-007: Persona Verification Missing System.runAs()
+            is_controller_test = bool(re.search(r'(Controller|Portal|Community|Guest)', cls_file.stem, re.IGNORECASE))
+            if is_controller_test and "System.runAs" not in clean and "runAs" not in clean:
+                self.add_finding(
+                    rule_id="APEX-TEST-007",
+                    category="Test Security & Access Control",
+                    severity="HIGH",
+                    target=cls_file.stem,
+                    file_path=cls_file,
+                    line_num=1,
+                    issue=f"Controller/Portal test class '{cls_file.stem}' does not use System.runAs() to verify persona permissions and sharing rules.",
+                    remediation="Execute test scenarios under standard, community, or guest user personas using System.runAs(testUser) to validate FLS and sharing boundaries."
+                )
+
+            # APEX-DATA-002: Mixed DML Setup/Non-Setup Hazard
+            has_setup_dml = bool(re.search(r'\b(insert|update)\s+[^;]*\b(User|UserRole|Group|GroupMember|PermissionSetAssignment)\b', clean))
+            has_non_setup_dml = bool(re.search(r'\b(insert|update)\s+[^;]*\b(Account|Contact|Opportunity|Lead|Quote_Request__c|Case)\b', clean))
+            if has_setup_dml and has_non_setup_dml and "System.runAs" not in clean:
+                self.add_finding(
+                    rule_id="APEX-DATA-002",
+                    category="Apex Runtime Integrity",
+                    severity="HIGH",
+                    target=cls_file.stem,
+                    file_path=cls_file,
+                    line_num=1,
+                    issue=f"Test class '{cls_file.stem}' performs DML on both setup and non-setup objects in the same transaction without System.runAs().",
+                    remediation="Enclose setup object DML (User/Group/PermSet) in System.runAs(new User(Id = UserInfo.getUserId())) to prevent MIXED_DML_OPERATION errors."
+                )
+
     # --------------------------------------------------------------------------
-    # 5. Live Org Coverage Verification (Tooling API)
+    # 5. Live Org Verification (Tooling API)
     # --------------------------------------------------------------------------
-    def verify_live_org_coverage(self):
+    def verify_live_org(self):
+        """Comprehensive live org verification: code coverage, failing test executions, and in-flight test queues."""
         if not self.target_org:
             return
 
-        print(f"[*] Querying live org '{self.target_org}' via Tooling API for Apex coverage...")
         import subprocess
-        query = (
+        # 1. Live Apex Code Coverage
+        print(f"[*] Querying live org '{self.target_org}' via Tooling API for Apex coverage...")
+        query_cov = (
             "SELECT ApexClassOrTrigger.Name, NumLinesCovered, NumLinesUncovered "
             "FROM ApexCodeCoverageAggregate "
             "WHERE ApexClassOrTrigger.Name != NULL"
         )
-        cmd = [
-            "sf", "data", "query",
-            "--target-org", self.target_org,
-            "--use-tooling-api",
-            "--query", query,
-            "--json"
-        ]
         try:
+            cmd = ["sf", "data", "query", "--target-org", self.target_org, "--use-tooling-api", "--query", query_cov, "--json"]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if res.returncode == 0:
                 data = json.loads(res.stdout)
@@ -356,7 +456,6 @@ class ApexVerifier:
                     total = covered + uncovered
                     pct = (covered / total * 100.0) if total > 0 else 0.0
 
-                    # Triggers must have >0% coverage
                     if name in ["RSLI_QuoteTrigger", "RSLI_NOSTrigger", "RSLI_QuoteClass_Trigger", "CrownQRTrigger"] and covered == 0:
                         self.add_finding(
                             rule_id="APEX-COV-001",
@@ -380,7 +479,67 @@ class ApexVerifier:
                             remediation=f"Add unit test scenarios exercising branches and edge cases in {name}."
                         )
         except Exception as e:
-            print(f"[-] Tooling API query skipped or encountered error: {e}")
+            print(f"[-] Tooling API coverage query skipped: {e}")
+
+        # 2. Live Org Failed Test Results (ApexTestResult)
+        print(f"[*] Querying live org '{self.target_org}' via Tooling API for failed test executions...")
+        query_fail = (
+            "SELECT ApexClass.Name, MethodName, Outcome, Message "
+            "FROM ApexTestResult "
+            "WHERE Outcome = 'Fail' "
+            "ORDER BY SystemModstamp DESC "
+            "LIMIT 20"
+        )
+        try:
+            cmd = ["sf", "data", "query", "--target-org", self.target_org, "--use-tooling-api", "--query", query_fail, "--json"]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if res.returncode == 0:
+                data = json.loads(res.stdout)
+                records = data.get("result", {}).get("records", [])
+                for r in records:
+                    cls_name = r.get("ApexClass", {}).get("Name", "UnknownClass")
+                    method_name = r.get("MethodName", "unknownMethod")
+                    msg = r.get("Message", "Unhandled Exception")
+                    self.add_finding(
+                        rule_id="APEX-LIVE-001",
+                        category="Live Org Verification",
+                        severity="CRITICAL",
+                        target=f"{cls_name}.{method_name}",
+                        file_path=f"force-app/main/default/classes/{cls_name}.cls",
+                        line_num=1,
+                        issue=f"Live test failure detected in {self.target_org}: {cls_name}.{method_name} failed with: {msg}",
+                        remediation="Investigate exception details, fix test setup data, ensure picklist values are valid, and verify validation rules."
+                    )
+        except Exception as e:
+            print(f"[-] Tooling API test result query skipped: {e}")
+
+        # 3. Live Org In-Flight Test Queue (ApexTestQueueItem)
+        print(f"[*] Querying live org '{self.target_org}' via Tooling API for test queue status...")
+        query_queue = (
+            "SELECT Id, Status, ApexClass.Name "
+            "FROM ApexTestQueueItem "
+            "WHERE Status IN ('Queued', 'Holding', 'Preparing', 'Processing') "
+            "LIMIT 10"
+        )
+        try:
+            cmd = ["sf", "data", "query", "--target-org", self.target_org, "--use-tooling-api", "--query", query_queue, "--json"]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if res.returncode == 0:
+                data = json.loads(res.stdout)
+                records = data.get("result", {}).get("records", [])
+                if records:
+                    self.add_finding(
+                        rule_id="APEX-LIVE-002",
+                        category="Live Org Verification",
+                        severity="MEDIUM",
+                        target=f"ApexTestQueue ({len(records)} active jobs)",
+                        file_path="force-app/main/default",
+                        line_num=1,
+                        issue=f"{len(records)} test run(s) currently in-flight ({records[0].get('Status')}) in {self.target_org}.",
+                        remediation="Wait for test queue execution to finish before running automated test gates or deployments."
+                    )
+        except Exception as e:
+            print(f"[-] Tooling API test queue query skipped: {e}")
 
     # --------------------------------------------------------------------------
     # 5. Runtime Exceptions & Asynchronous Apex
@@ -669,8 +828,10 @@ class ApexVerifier:
         self.verify_agentforce_and_invocables()
         self.verify_enterprise_architecture()
         self.verify_test_quality()
-        self.verify_live_org_coverage()
+        self.verify_live_org()
         return self.findings
+
+    verify_live_org_coverage = verify_live_org
 
     # --------------------------------------------------------------------------
     # Output Exporters

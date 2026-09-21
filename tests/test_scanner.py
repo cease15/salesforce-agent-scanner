@@ -203,6 +203,142 @@ class TestApexVerifier(unittest.TestCase):
         self.assertTrue(len(reserved_findings) > 0)
         self.assertEqual(reserved_findings[0].get("severity"), "CRITICAL")
 
+    def test_hardcoded_id_and_fluff_in_test_class(self):
+        apex_code = """
+        @isTest
+        private class SampleFluffTest {
+            @isTest
+            static void testMethodA() {
+                Id hardcodedAcc = '0013q00001bcXYZAA2';
+                System.assert(true, 'Component is valid');
+                Assert.isTrue(true);
+            }
+        }
+        """
+        cls_file = self.classes_dir / "SampleFluffTest.cls"
+        cls_file.write_text(apex_code)
+
+        verifier = ApexVerifier(repo_dir=self.root)
+        findings = verifier.run_all()
+        id_findings = [f for f in findings if f.get("rule_id") == "APEX-TEST-004"]
+        fluff_findings = [f for f in findings if f.get("rule_id") == "APEX-TEST-008"]
+        self.assertTrue(len(id_findings) > 0)
+        self.assertTrue(len(fluff_findings) >= 2)
+        self.assertEqual(id_findings[0].get("severity"), "HIGH")
+        self.assertEqual(fluff_findings[0].get("severity"), "HIGH")
+
+    def test_missing_test_setup_and_start_stop_boundary(self):
+        apex_code = """
+        @isTest
+        private class RepetitiveDmlTest {
+            @isTest static void testOne() {
+                insert new Account(Name = 'A1');
+                System.enqueueJob(new MockQueueable());
+                Assert.areEqual(1, [SELECT count() FROM Account]);
+            }
+            @isTest static void testTwo() {
+                insert new Account(Name = 'A2');
+                Assert.areEqual(1, [SELECT count() FROM Account]);
+            }
+            @isTest static void testThree() {
+                insert new Account(Name = 'A3');
+                Assert.areEqual(1, [SELECT count() FROM Account]);
+            }
+        }
+        """
+        cls_file = self.classes_dir / "RepetitiveDmlTest.cls"
+        cls_file.write_text(apex_code)
+
+        verifier = ApexVerifier(repo_dir=self.root)
+        findings = verifier.run_all()
+        setup_findings = [f for f in findings if f.get("rule_id") == "APEX-TEST-006"]
+        async_findings = [f for f in findings if f.get("rule_id") == "APEX-TEST-005"]
+        self.assertTrue(len(setup_findings) > 0)
+        self.assertTrue(len(async_findings) > 0)
+        self.assertEqual(setup_findings[0].get("severity"), "MEDIUM")
+        self.assertEqual(async_findings[0].get("severity"), "MEDIUM")
+
+    def test_missing_runas_in_controller_test_and_mixed_dml(self):
+        apex_code = """
+        @isTest
+        private class DeltaPortalControllerTest {
+            @isTest static void testPortalMethod() {
+                insert new Account(Name = 'Test Corp');
+                insert new User(Username = 'guest@portal.test', Alias='gp');
+                DeltaPortalController.doSomething();
+            }
+        }
+        """
+        cls_file = self.classes_dir / "DeltaPortalControllerTest.cls"
+        cls_file.write_text(apex_code)
+
+        verifier = ApexVerifier(repo_dir=self.root)
+        findings = verifier.run_all()
+        runas_findings = [f for f in findings if f.get("rule_id") == "APEX-TEST-007"]
+        mixed_findings = [f for f in findings if f.get("rule_id") == "APEX-DATA-002"]
+        self.assertTrue(len(runas_findings) > 0)
+        self.assertTrue(len(mixed_findings) > 0)
+        self.assertEqual(runas_findings[0].get("severity"), "HIGH")
+        self.assertEqual(mixed_findings[0].get("severity"), "HIGH")
+
+    import unittest.mock
+    @unittest.mock.patch("subprocess.run")
+    def test_live_org_coverage_and_failures(self, mock_run):
+        def fake_run(cmd, capture_output=True, text=True, timeout=30):
+            class FakeRes:
+                returncode = 0
+            query = ""
+            for i, arg in enumerate(cmd):
+                if arg == "--query":
+                    query = cmd[i+1]
+                    break
+            import json
+            res = FakeRes()
+            if "ApexCodeCoverageAggregate" in query:
+                res.stdout = json.dumps({
+                    "result": {
+                        "records": [
+                            {"ApexClassOrTrigger": {"Name": "CrownQRTrigger"}, "NumLinesCovered": 0, "NumLinesUncovered": 10},
+                            {"ApexClassOrTrigger": {"Name": "DeltaService"}, "NumLinesCovered": 10, "NumLinesUncovered": 90}
+                        ]
+                    }
+                })
+            elif "ApexTestResult" in query:
+                res.stdout = json.dumps({
+                    "result": {
+                        "records": [
+                            {"ApexClass": {"Name": "BrokenTest"}, "MethodName": "testFailure", "Message": "DmlException: FIELD_CUSTOM_VALIDATION_EXCEPTION"}
+                        ]
+                    }
+                })
+            elif "ApexTestQueueItem" in query:
+                res.stdout = json.dumps({
+                    "result": {
+                        "records": [
+                            {"Id": "709000000000001", "Status": "Processing", "ApexClass": {"Name": "SuiteTest"}}
+                        ]
+                    }
+                })
+            else:
+                res.stdout = "{}"
+            return res
+
+        mock_run.side_effect = fake_run
+
+        verifier = ApexVerifier(repo_dir=self.root, target_org="test-scratch")
+        findings = verifier.run_all()
+        cov_findings = [f for f in findings if f.get("rule_id") == "APEX-COV-001"]
+        low_cov = [f for f in findings if f.get("rule_id") == "APEX-COV-002"]
+        fail_findings = [f for f in findings if f.get("rule_id") == "APEX-LIVE-001"]
+        queue_findings = [f for f in findings if f.get("rule_id") == "APEX-LIVE-002"]
+
+        self.assertTrue(len(cov_findings) > 0)
+        self.assertTrue(len(low_cov) > 0)
+        self.assertTrue(len(fail_findings) > 0)
+        self.assertTrue(len(queue_findings) > 0)
+        self.assertEqual(fail_findings[0].get("severity"), "CRITICAL")
+        self.assertEqual(cov_findings[0].get("severity"), "CRITICAL")
+
 
 class TestLwcVerifier(unittest.TestCase):
     def setUp(self):
