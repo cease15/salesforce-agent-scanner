@@ -218,6 +218,136 @@ User u = TestDataFactory.createStandardUser('testuser@example.com.test');""",
 }""",
         "reference": "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_testing_best_practices.htm"
     },
+    "APEX-TEST-004": {
+        "title": "Hardcoded Salesforce Record ID in Test",
+        "category": "Test Quality & Portability",
+        "severity": "HIGH",
+        "description": "Test code contains hardcoded 15 or 18 character Salesforce record IDs (e.g. '001...', '003...', '012...').",
+        "impact": "Record IDs are specific to a single org instance. Hardcoded IDs immediately fail when deployed to scratch orgs, CI pipelines, or alternative sandboxes.",
+        "bad_example": """Id accId = '0013q00001bcXYZAA2'; // Non-portable record ID!
+Id rTypeId = '012Po000000gKbrIAE'; // Fails across environments""",
+        "good_example": """// Query schema or factory instead:
+Id rTypeId = Schema.SObjectType.Quote_Request__c.getRecordTypeInfosByDeveloperName().get('Standard').getRecordTypeId();
+Account acc = TestDataFactory.createAccount('Test Corp');""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_testing_best_practices.htm"
+    },
+    "APEX-TEST-005": {
+        "title": "Missing Test.startTest() / Test.stopTest() Boundary",
+        "category": "Test Quality & Portability",
+        "severity": "MEDIUM",
+        "description": "Test method performs data modifications or executes asynchronous code without Test.startTest() and Test.stopTest() boundaries.",
+        "impact": "Governor limits are not refreshed for the execution under test. Asynchronous logic (@future, Queueable, Batchable) will not execute synchronously, causing false assertion failures.",
+        "bad_example": """@isTest static void testAsyncJob() {
+    insert new Account(Name = 'Test');
+    System.enqueueJob(new MyQueueable());
+    // Fails because queueable executes asynchronously outside start/stop boundary
+    System.assertEquals(1, [SELECT count() FROM Audit_Log__c]);
+}""",
+        "good_example": """@isTest static void testAsyncJob() {
+    insert new Account(Name = 'Test');
+    Test.startTest(); // Resets governor limits
+    System.enqueueJob(new MyQueueable());
+    Test.stopTest();  // Forces queueable completion
+    Assert.areEqual(1, [SELECT count() FROM Audit_Log__c]);
+}""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_testing_tools_start_stop_test.htm"
+    },
+    "APEX-TEST-006": {
+        "title": "Missing @testSetup Data Factory Pattern",
+        "category": "Test Performance & Data Architecture",
+        "severity": "MEDIUM",
+        "description": "Test class contains 3 or more test methods with redundant DML data creation without defining a static @testSetup method.",
+        "impact": "Significantly inflates test suite execution time and sandbox CPU limits by re-inserting identical test records on every test method instead of using cached checkpoint data.",
+        "bad_example": """@isTest static void testA() { Account a = new Account(Name='A'); insert a; ... }
+@isTest static void testB() { Account a = new Account(Name='A'); insert a; ... }
+@isTest static void testC() { Account a = new Account(Name='A'); insert a; ... }""",
+        "good_example": """@testSetup static void setup() {
+    Account a = new Account(Name='A');
+    insert a;
+}
+@isTest static void testA() { Account a = [SELECT Id FROM Account LIMIT 1]; ... }""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_testing_testsetup_using.htm"
+    },
+    "APEX-TEST-007": {
+        "title": "Persona Verification Missing System.runAs()",
+        "category": "Test Security & Access Control",
+        "severity": "HIGH",
+        "description": "Controller or security-sensitive class is tested without executing under specific user personas using System.runAs().",
+        "impact": "Tests execute with full System Administrator privileges by default, masking Field-Level Security (FLS), sharing rule, and external Community/Portal user permission defects.",
+        "bad_example": """@isTest static void testPortalController() {
+    // Runs as Admin in test context - fails to catch FLS or guest user lockdown bugs!
+    DeltaQuoteController.getQuotes();
+}""",
+        "good_example": """@isTest static void testPortalController() {
+    User portalUser = [SELECT Id FROM User WHERE Profile.Name = 'RSLI Customer Community' LIMIT 1];
+    System.runAs(portalUser) {
+        DeltaQuoteController.getQuotes();
+    }
+}""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_testing_tools_runas.htm"
+    },
+    "APEX-TEST-008": {
+        "title": "Meaningless Assertion Fluff",
+        "category": "Test Quality & Portability",
+        "severity": "HIGH",
+        "description": "Test method contains tautological assertions such as System.assert(true), System.assertEquals(1, 1), or Assert.isTrue(true).",
+        "impact": "Deceives code quality metrics and assertion gates without actually validating system state, computation accuracy, or database mutations.",
+        "bad_example": """System.assert(true, 'Component exists in org');
+Assert.isTrue(true);
+System.assertEquals(1, 1);""",
+        "good_example": """Quote_Request__c qr = [SELECT Status__c FROM Quote_Request__c WHERE Id = :qrId];
+Assert.areEqual('Submitted', qr.Status__c, 'Quote Request status must transition to Submitted');""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_testing_best_practices.htm"
+    },
+    "APEX-DATA-001": {
+        "title": "Test Query Dependency on Unseeded Data",
+        "category": "Test Data Architecture",
+        "severity": "HIGH",
+        "description": "Test method executes SOQL queries for business records without creating them in @testSetup or mocking them first.",
+        "impact": "Tests fail unpredictably in scratch orgs, CI/CD runners, and refreshed sandboxes where pre-existing records do not exist.",
+        "bad_example": """@isTest static void testApproval() {
+    // Fails in fresh org because this specific record does not exist
+    Account a = [SELECT Id FROM Account WHERE Name = 'RSLI Main' LIMIT 1];
+}""",
+        "good_example": """@testSetup static void setup() {
+    insert new Account(Name = 'RSLI Main');
+}""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_testing_load_data.htm"
+    },
+    "APEX-DATA-002": {
+        "title": "Mixed DML Setup/Non-Setup Hazard",
+        "category": "Apex Runtime Integrity",
+        "severity": "HIGH",
+        "description": "Test setup performs DML on setup objects (User, Group, PermissionSet) and non-setup objects (Account, Quote) in the same transaction context.",
+        "impact": "Throws unhandled MIXED_DML_OPERATION exception: DML operation on setup object is not permitted after you have updated a non-setup object.",
+        "bad_example": """insert new Account(Name = 'Acme');
+insert new User(Username = 'u@test.com', ...); // CRASH: MIXED_DML_OPERATION!""",
+        "good_example": """insert new Account(Name = 'Acme');
+System.runAs(new User(Id = UserInfo.getUserId())) {
+    insert new User(Username = 'u@test.com', ...); // Isolated in separate DML context
+}""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_dml_non_mix_sobjects.htm"
+    },
+    "APEX-LIVE-001": {
+        "title": "Target Org Live Test Failure Detected",
+        "category": "Live Org Verification",
+        "severity": "CRITICAL",
+        "description": "Tooling API query on ApexTestResult detected active failing test methods with unhandled exceptions in the target org.",
+        "impact": "Broken test classes fail CI validation gates, block production deployments, and signal active runtime regressions.",
+        "bad_example": """ApexTestResult: InforceRateController_Test.testGetInforceRates_NoAccess_Denied: System.DmlException: Insert failed. First exception on row 0; first error: INVALID_OR_NULL_FOR_RESTRICTED_PICKLIST""",
+        "good_example": """Ensure all required picklist values, validation rule requirements, and object relationships are satisfied by test factories before assertion.""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/tooling_api_objects_apextestresult.htm"
+    },
+    "APEX-LIVE-002": {
+        "title": "Target Org Test Queue In-Flight Hazard",
+        "category": "Live Org Verification",
+        "severity": "MEDIUM",
+        "description": "Tooling API query detected test runs currently queued or executing in the target org.",
+        "impact": "Running concurrent test runs or deployments while org test queues are active produces lock contention and inaccurate code coverage numbers.",
+        "bad_example": """ApexTestQueueItem: 5 items in 'Queued' or 'Processing' state.""",
+        "good_example": """Wait for test queue items to complete or clear prior execution queue before running pipeline test gates.""",
+        "reference": "https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/tooling_api_objects_apextestqueueitem.htm"
+    },
 
     # --------------------------------------------------------------------------
     # LWC Specialist Rules (/lwc*)
