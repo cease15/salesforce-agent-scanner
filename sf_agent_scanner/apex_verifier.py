@@ -382,10 +382,110 @@ class ApexVerifier:
         except Exception as e:
             print(f"[-] Tooling API query skipped or encountered error: {e}")
 
+    # --------------------------------------------------------------------------
+    # 5. Runtime Exceptions & Asynchronous Apex
+    # --------------------------------------------------------------------------
+    def verify_runtime_and_exceptions(self):
+        """Deep runtime integrity checks: AuraHandledException sanitization, DML in cacheable methods, and @future typing."""
+        if not self.classes_dir.exists():
+            return
+
+        for cls_file in self.classes_dir.glob("*.cls"):
+            try:
+                content = cls_file.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            if "@isTest" in content or "testMethod" in content:
+                continue
+
+            clean = self.strip_comments(content)
+
+            # 1. APEX-AURA-002: AuraHandledException without setMessage()
+            # If throw new AuraHandledException(...) is called directly
+            ahe_matches = re.finditer(r'throw\s+new\s+AuraHandledException\s*\([^)]*\);', clean)
+            for am in ahe_matches:
+                line_num = content[:am.start()].count('\n') + 1
+                self.add_finding(
+                    rule_id="APEX-AURA-002",
+                    category="Exception Sanitization",
+                    severity="HIGH",
+                    target=cls_file.stem,
+                    file_path=cls_file,
+                    line_num=line_num,
+                    issue="AuraHandledException instantiated and thrown in a single statement without calling e.setMessage(). Salesforce strips the message and displays generic 'Script-thrown exception' to portal/LWC users.",
+                    remediation="Instantiate the exception into a variable, explicitly invoke e.setMessage('user-safe message'), then throw e."
+                )
+
+            # 2. APEX-AURA-CACHE-001: DML in Cacheable Method
+            cacheable_method_pattern = re.compile(
+                r'@AuraEnabled\s*\(\s*cacheable\s*=\s*true\s*\)\s*(?:public|global|static|\s)+[\w<>\[\]]+\s+(\w+)\s*\([^)]*\)\s*\{',
+                re.IGNORECASE
+            )
+            for cm in cacheable_method_pattern.finditer(clean):
+                method_name = cm.group(1)
+                start_idx = cm.end() - 1
+                depth = 0
+                end_idx = start_idx
+                for i in range(start_idx, len(clean)):
+                    if clean[i] == '{':
+                        depth += 1
+                    elif clean[i] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            end_idx = i
+                            break
+                method_body = clean[start_idx:end_idx]
+                method_line = content[:cm.start()].count('\n') + 1
+
+                dml_match = re.search(r'\b(insert|update|delete|upsert)\s+[a-zA-Z0-9_]+;', method_body, re.IGNORECASE)
+                if not dml_match:
+                    dml_match = re.search(r'\bDatabase\.(insert|update|delete|upsert)\s*\(', method_body, re.IGNORECASE)
+                if dml_match:
+                    dml_line = method_line + method_body[:dml_match.start()].count('\n')
+                    self.add_finding(
+                        rule_id="APEX-AURA-CACHE-001",
+                        category="Apex Runtime Integrity",
+                        severity="CRITICAL",
+                        target=f"{cls_file.stem}.{method_name}",
+                        file_path=cls_file,
+                        line_num=dml_line,
+                        issue=f"Method '{method_name}' is annotated with @AuraEnabled(cacheable=true) but executes DML. Throws System.InvalidParameterValueException: DML currently not allowed at runtime.",
+                        remediation="Remove cacheable=true from the @AuraEnabled annotation or extract the DML operation into a separate, non-cacheable action."
+                    )
+
+            # 3. APEX-ASYNC-001: Non-primitive parameter in @future method
+            future_pattern = re.compile(
+                r'@future\s*(?:\([^)]*\))?\s*(?:public|global|private|protected)?\s*static\s+void\s+(\w+)\s*\(([^)]*)\)',
+                re.IGNORECASE
+            )
+            for fm in future_pattern.finditer(clean):
+                method_name = fm.group(1)
+                param_str = fm.group(2).strip()
+                method_line = content[:fm.start()].count('\n') + 1
+                if param_str:
+                    non_primitive_match = re.search(
+                        r'\b(Account|Contact|Case|Lead|Opportunity|User|Quote|sObject)\b',
+                        param_str,
+                        re.IGNORECASE
+                    )
+                    if non_primitive_match:
+                        self.add_finding(
+                            rule_id="APEX-ASYNC-001",
+                            category="Asynchronous Apex",
+                            severity="CRITICAL",
+                            target=f"{cls_file.stem}.{method_name}",
+                            file_path=cls_file,
+                            line_num=method_line,
+                            issue=f"@future method '{method_name}' declares non-primitive parameter ({non_primitive_match.group(0)}). @future methods only accept primitive types or collections of primitives.",
+                            remediation="Pass List<Id> of records instead of sObject instances, or refactor to Queueable Apex (implements Queueable)."
+                        )
+
     def run_all(self):
         self.verify_triggers()
         self.verify_bulkification()
         self.verify_sharing_and_security()
+        self.verify_runtime_and_exceptions()
         self.verify_test_quality()
         self.verify_live_org_coverage()
         return self.findings

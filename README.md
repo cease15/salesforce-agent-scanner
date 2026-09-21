@@ -155,6 +155,18 @@ sf-agent-scan [-h] [--repo-dir REPO_DIR] [--scope {all,apex,lwc,security}]
 | `--junit` | Output file path for JUnit XML test report | `None` |
 | `--summary-md` | Output file path for Markdown summary (`$GITHUB_STEP_SUMMARY`) | `None` |
 | `--ado` | Emit native Azure DevOps logging commands (`##vso[...]`) | `False` |
+| `--explain <RULE>` | Explain a specialist rule with full diagnostics and copy-ready fix | `None` |
+| `--list-rules` | List all cataloged specialist rules and best practice gates | `False` |
+
+### Query Specialist Knowledge from CLI
+```bash
+# List all cataloged specialist verification rules
+sf-agent-scan --list-rules
+
+# Explain a specific rule with anti-patterns and clean remediations
+sf-agent-scan --explain APEX-AURA-002
+sf-agent-scan --explain LWC-GETTER-MUTATE
+```
 
 ---
 

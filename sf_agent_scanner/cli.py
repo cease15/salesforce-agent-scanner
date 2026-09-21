@@ -17,11 +17,13 @@ try:
     from sf_agent_scanner.apex_verifier import ApexVerifier
     from sf_agent_scanner.lwc_verifier import LwcVerifier
     from sf_agent_scanner.reporter import ScanReporter
+    from sf_agent_scanner.advisor import SpecialistAdvisor
 except ImportError:
     from metadata_security import SecurityAuditor
     from apex_verifier import ApexVerifier
     from lwc_verifier import LwcVerifier
     from reporter import ScanReporter
+    from advisor import SpecialistAdvisor
 
 def main():
     parser = argparse.ArgumentParser(
@@ -50,7 +52,26 @@ Examples:
     parser.add_argument("--json", action="store_true", help="Output all findings as JSON to stdout")
     parser.add_argument("--summary-md", help="File path to write Markdown summary (e.g. $GITHUB_STEP_SUMMARY)")
     parser.add_argument("--ado", action="store_true", help="Emit Azure DevOps pipeline logging commands")
+    parser.add_argument("--explain", help="Explain a specialist rule with full diagnostics and remediation (e.g. --explain APEX-AURA-002)")
+    parser.add_argument("--list-rules", action="store_true", help="List all cataloged specialist rules and best practice gates")
     args = parser.parse_args()
+
+    # Rule explanation / listing handlers
+    if args.explain:
+        print(SpecialistAdvisor.explain(args.explain))
+        sys.exit(0)
+
+    if args.list_rules:
+        rules = SpecialistAdvisor.list_rules()
+        print("\n" + "="*95)
+        print("          SALESFORCE SPECIALIST AGENT VERIFICATION RULES CATALOG          ")
+        print("="*95)
+        print(f"{'RULE ID':<22} | {'SEVERITY':<10} | {'CATEGORY':<28} | {'TITLE'}")
+        print("-"*95)
+        for rid, r in sorted(rules.items()):
+            print(f"{rid:<22} | {r['severity']:<10} | {r['category']:<28} | {r['title']}")
+        print("="*95 + "\n")
+        sys.exit(0)
 
     # Determine execution scope
     run_all = args.all or (not args.apex and not args.lwc and not args.security and args.scope == "all")

@@ -257,6 +257,131 @@ class LwcVerifier:
                         remediation="Add alternative-text='Description of button action' for screen reader accessibility."
                     )
 
+    # --------------------------------------------------------------------------
+    # 7. Advanced Specialist Checks (Playbooks & Defect Catalog)
+    # --------------------------------------------------------------------------
+    def verify_getter_mutations(self, comp_dir, js_file, content, clean):
+        """Detects assignment to a getter-only property (TypeError in strict mode)."""
+        getters = set(re.findall(r'\bget\s+([a-zA-Z0-9_]+)\s*\(', clean))
+        setters = set(re.findall(r'\bset\s+([a-zA-Z0-9_]+)\s*\(', clean))
+        getter_only = getters - setters
+
+        for prop in getter_only:
+            pattern = re.compile(rf'\bthis\.{prop}\s*=', re.MULTILINE)
+            for m in pattern.finditer(clean):
+                line_num = content[:m.start()].count('\n') + 1
+                self.add_finding(
+                    rule_id="LWC-GETTER-MUTATE",
+                    category="Runtime Exception",
+                    severity="CRITICAL",
+                    target=f"{comp_dir.name} -> this.{prop}",
+                    file_path=js_file,
+                    line_num=line_num,
+                    issue=f"Assignment to getter-only accessor 'this.{prop}'. Throws unhandled TypeError in strict mode at runtime.",
+                    remediation=f"Define a corresponding 'set {prop}(value)' setter or mutate an internal backing variable (e.g. this._{prop})."
+                )
+
+    def verify_refresh_apex(self, comp_dir, js_file, content, clean):
+        """Detects refreshApex(this.prop.data) anti-pattern."""
+        if "refreshApex" not in clean:
+            return
+
+        bad_refresh = re.finditer(r'refreshApex\s*\(\s*this\.([a-zA-Z0-9_]+)\.data\s*\)', clean)
+        for br in bad_refresh:
+            line_num = content[:br.start()].count('\n') + 1
+            prop_name = br.group(1)
+            self.add_finding(
+                rule_id="LWC-REFRESH-001",
+                category="Data Service (LDS) Integrity",
+                severity="HIGH",
+                target=f"{comp_dir.name} -> refreshApex(this.{prop_name}.data)",
+                file_path=js_file,
+                line_num=line_num,
+                issue=f"refreshApex passed raw data property 'this.{prop_name}.data' instead of the wired configuration object. LDS refresh will fail silently.",
+                remediation=f"Store the complete wire result object in a property (_wired{prop_name.capitalize()}) and pass that to refreshApex."
+            )
+
+    def verify_mixin_extension(self, comp_dir, js_file, content, clean):
+        """Detects use of NavigationMixin when class does not extend NavigationMixin(LightningElement)."""
+        if "NavigationMixin.Navigate" in clean or "NavigationMixin.GenerateUrl" in clean:
+            if not re.search(r'class\s+\w+\s+extends\s+NavigationMixin\s*\(\s*LightningElement\s*\)', clean):
+                line_num = 1
+                nav_m = re.search(r'NavigationMixin\.(Navigate|GenerateUrl)', clean)
+                if nav_m:
+                    line_num = content[:nav_m.start()].count('\n') + 1
+                self.add_finding(
+                    rule_id="LWC-MIXIN-001",
+                    category="Navigation Architecture",
+                    severity="CRITICAL",
+                    target=f"{comp_dir.name} -> NavigationMixin",
+                    file_path=js_file,
+                    line_num=line_num,
+                    issue=f"Component '{comp_dir.name}' invokes NavigationMixin methods without extending NavigationMixin(LightningElement). Throws TypeError at runtime.",
+                    remediation=f"Update class declaration: 'export default class {comp_dir.name} extends NavigationMixin(LightningElement) {{ ... }}'."
+                )
+
+    def verify_aura_framework_leak(self, comp_dir, js_file, content, clean):
+        """Detects legacy Aura framework ($A) references in LWC."""
+        aura_matches = re.finditer(r'(?<![a-zA-Z0-9_])\$A\b', clean)
+        for am in aura_matches:
+            line_num = content[:am.start()].count('\n') + 1
+            self.add_finding(
+                rule_id="LWC-AURA-001",
+                category="Modernization & Runtime Integrity",
+                severity="CRITICAL",
+                target=f"{comp_dir.name} -> $A reference",
+                file_path=js_file,
+                line_num=line_num,
+                issue="Legacy Aura framework global '$A' detected in LWC. $A is undefined in LWC and throws ReferenceError.",
+                remediation="Remove $A reference. Use modern LWC APIs (e.g. notifyRecordUpdateAvailable from lightning/uiRecordApi or ShowToastEvent)."
+            )
+
+    def verify_ssr_integrity(self, comp_dir, js_file, content, clean):
+        """Detects browser globals (window, document) declared in top-level class field initializers breaking LWR SSR."""
+        class_match = re.search(r'class\s+\w+\s+extends\s+[\w\(\)]+\s*\{', clean)
+        if not class_match:
+            return
+
+        class_start = class_match.end()
+        # Look for property initializers before first method: prop = window.X or prop = document.X
+        first_method = re.search(r'\b(constructor|connectedCallback|renderedCallback|get |set |\w+\s*\([^)]*\)\s*\{)', clean[class_start:])
+        class_header = clean[class_start:class_start + first_method.start()] if first_method else clean[class_start:class_start + 400]
+
+        ssr_leak = re.search(r'\b(window|document|localStorage|sessionStorage)\.[a-zA-Z0-9_]+', class_header)
+        if ssr_leak:
+            line_num = content[:class_start + ssr_leak.start()].count('\n') + 1
+            self.add_finding(
+                rule_id="LWC-SSR-001",
+                category="Experience Cloud (LWR)",
+                severity="HIGH",
+                target=f"{comp_dir.name} -> {ssr_leak.group(0)}",
+                file_path=js_file,
+                line_num=line_num,
+                issue=f"Direct browser global reference '{ssr_leak.group(0)}' in class field initializer. Crashes Server-Side Rendering (SSR) in LWR with ReferenceError.",
+                remediation="Move browser-dependent initialization into connectedCallback() guarded with 'if (typeof window !== \"undefined\")'."
+            )
+
+    def verify_csv_formula_injection(self, comp_dir, js_file, content, clean):
+        """Detects CSV generation without formula injection neutralization."""
+        is_csv_generator = bool(re.search(r'(exportToCsv|downloadCsv|text/csv|["\']data:text/csv)', clean, re.IGNORECASE))
+        if is_csv_generator:
+            has_sanitization = bool(re.search(r'(\^\[?[\=\+\-\@\t\r]|neutralize|sanitizeCsv|escapeCsv)', clean, re.IGNORECASE))
+            if not has_sanitization:
+                line_num = 1
+                csv_m = re.search(r'(exportToCsv|downloadCsv|text/csv)', clean, re.IGNORECASE)
+                if csv_m:
+                    line_num = content[:csv_m.start()].count('\n') + 1
+                self.add_finding(
+                    rule_id="LWC-FORMULA-CSV",
+                    category="Application Security",
+                    severity="HIGH",
+                    target=f"{comp_dir.name} -> CSV Export",
+                    file_path=js_file,
+                    line_num=line_num,
+                    issue="CSV generation detected without formula injection defense. Cells starting with '=', '+', '-', or '@' can execute arbitrary system commands when opened in Excel.",
+                    remediation="Neutralize spreadsheet formulas by prepending an apostrophe (') to any string field starting with '=', '+', '-', or '@'."
+                )
+
     def run_all(self):
         if not self.lwc_dir.exists():
             return self.findings
@@ -279,6 +404,12 @@ class LwcVerifier:
                 self.verify_api_mutations(comp_dir, js_file, content, clean)
                 self.verify_navigation(comp_dir, js_file, content, clean)
                 self.verify_environment_decoupling(comp_dir, js_file, content, clean)
+                self.verify_getter_mutations(comp_dir, js_file, content, clean)
+                self.verify_refresh_apex(comp_dir, js_file, content, clean)
+                self.verify_mixin_extension(comp_dir, js_file, content, clean)
+                self.verify_aura_framework_leak(comp_dir, js_file, content, clean)
+                self.verify_ssr_integrity(comp_dir, js_file, content, clean)
+                self.verify_csv_formula_injection(comp_dir, js_file, content, clean)
 
             # Verify Metadata
             self.verify_metadata(comp_dir)
